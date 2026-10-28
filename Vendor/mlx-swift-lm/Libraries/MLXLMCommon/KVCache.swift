@@ -856,6 +856,107 @@ private final class RotorQuantMSEQuantizer {
         return restored.asType(dtype)
     }
 
+    /// Unpadded IsoQuant rows map one quaternion onto each group of four channels,
+    /// which is the layout the Metal codec kernels assume.
+    var supportsIsoCodecKernels: Bool {
+        variant == .iso && paddedDimension == dimension
+    }
+
+    /// Quantizes `[B, H, T, D]` vectors to packed indices `[B, H, T, packedWidth]`
+    /// and norms `[B, H, T]`.
+    func quantizePacked(_ vectors: MLXArray, useKernels: Bool) -> (packed: MLXArray, norms: MLXArray) {
+        guard useKernels, supportsIsoCodecKernels else {
+            let quantized = quantize(vectors)
+            return (PackedCentroidIndices.pack(quantized.indices, bitWidth: bits), quantized.norms)
+        }
+        let prefixShape = Array(vectors.shape.dropLast())
+        let rowCount = prefixShape.reduce(1, *)
+        let packedWidth = PackedCentroidIndices.packedByteCount(valueCount: storageDimension, bitWidth: bits)
+        let outputs = RotorQuantDecodeAttentionKernelManager.shared.isoQuantizeKernel(
+            [vectors, rotationParameters, boundariesArray],
+            template: [
+                ("T", vectors.dtype),
+                ("D", dimension),
+                ("BITS", bits),
+                ("LEVELS", boundariesArray.dim(0)),
+                ("PACKED_WIDTH", packedWidth),
+            ],
+            grid: (rowCount, 1, 1),
+            threadGroup: (min(rowCount, 64), 1, 1),
+            outputShapes: [prefixShape + [packedWidth], prefixShape],
+            outputDTypes: [.uint8, .float32]
+        )
+        return (outputs[0], outputs[1])
+    }
+
+    /// Restores the first `count` rows of packed storage `[B, H, capacity, packedWidth]`
+    /// with norms `[B, H, capacity]` to dense `[B, H, count, D]` vectors.
+    /// Restores the first `count` packed rows, followed by the first
+    /// `exactTail.count` rows of the dense tail storage when one is given.
+    func dequantizePacked(
+        storage packed: MLXArray,
+        norms: MLXArray,
+        count: Int,
+        dtype: DType,
+        useKernels: Bool,
+        exactTail: (storage: MLXArray, count: Int)? = nil
+    ) -> MLXArray {
+        let tail = exactTail.flatMap { $0.count > 0 ? $0 : nil }
+        func appendingTail(_ restored: MLXArray) -> MLXArray {
+            guard let tail else { return restored }
+            return concatenated(
+                [restored, castIfNeeded(tail.storage[.ellipsis, ..<tail.count, 0...], to: dtype)],
+                axis: 2
+            )
+        }
+        guard useKernels, supportsIsoCodecKernels else {
+            let indices = PackedCentroidIndices.unpack(
+                packed[.ellipsis, ..<count, 0...],
+                bitWidth: bits,
+                valueCount: storageDimension
+            )
+            return appendingTail(dequantize(indices: indices, norms: norms[.ellipsis, ..<count], dtype: dtype))
+        }
+        guard let tail, tail.storage.dtype == dtype else {
+            return appendingTail(isoDequantizeKernel(packed: packed, norms: norms, count: count, dtype: dtype, tail: nil))
+        }
+        return isoDequantizeKernel(packed: packed, norms: norms, count: count, dtype: dtype, tail: tail)
+    }
+
+    private func isoDequantizeKernel(
+        packed: MLXArray,
+        norms: MLXArray,
+        count: Int,
+        dtype: DType,
+        tail: (storage: MLXArray, count: Int)?
+    ) -> MLXArray {
+        let batch = packed.dim(0)
+        let heads = packed.dim(1)
+        // MLX binds inputs under 8 elements as `constant`; the placeholder
+        // stays a device buffer so a cache with and without a tail shares one
+        // pipeline.
+        let exact = tail?.storage ?? MLXArray.zeros([8], dtype: dtype)
+        let exactCount = tail?.count ?? 0
+        let rows = count + exactCount
+        let layout = MLXArray([
+            Int32(packed.dim(2)), Int32(count), Int32(tail?.storage.dim(2) ?? 0), Int32(exactCount),
+        ])
+        let threadCount = batch * heads * rows * (dimension / 4)
+        return RotorQuantDecodeAttentionKernelManager.shared.isoDequantizeKernel(
+            [packed, norms, centroids, rotationParameters, exact, layout],
+            template: [
+                ("T", dtype),
+                ("D", dimension),
+                ("BITS", bits),
+                ("PACKED_WIDTH", packed.dim(3)),
+            ],
+            grid: (threadCount, 1, 1),
+            threadGroup: (min(threadCount, 256), 1, 1),
+            outputShapes: [[batch, heads, rows, dimension]],
+            outputDTypes: [dtype]
+        )[0]
+    }
+
     private func padToBlockDimension(_ vectors: MLXArray) -> MLXArray {
         guard paddedDimension > dimension else { return vectors }
         let paddingShape = Array(vectors.shape.dropLast()) + [paddedDimension - dimension]
@@ -1096,7 +1197,11 @@ private func makeRotorQuantIsoCompressedBlockKernel() -> MLXFast.MLXFastKernel {
         const device T* exact_key_rows = exact_keys + ((batch * KV_HEADS + kv_head) * exact_capacity * D);
         const device T* exact_value_rows = exact_values + ((batch * KV_HEADS + kv_head) * exact_capacity * D);
 
-        constexpr uint GROUPS_PER_LANE = D / 128;
+        // Each lane owns every 32nd group of four channels. Head dimensions
+        // below 128 (LFM2's 64) leave the upper lanes idle; they still join
+        // `simd_sum` with zero partial scores.
+        constexpr uint GROUP_COUNT = D / 4;
+        constexpr uint GROUPS_PER_LANE = (GROUP_COUNT + 31) / 32;
         constexpr uint WORK_ITEMS = HEAD_REPEATS * GROUPS_PER_LANE;
         float4 q_rot[WORK_ITEMS];
         float4 accum_rot[WORK_ITEMS];
@@ -1114,9 +1219,14 @@ private func makeRotorQuantIsoCompressedBlockKernel() -> MLXFast.MLXFastKernel {
             uint base = group << 2;
             groups[i] = group;
             for (uint repeat = 0; repeat < HEAD_REPEATS; ++repeat) {
+                uint index = repeat * GROUPS_PER_LANE + i;
+                accum_rot[index] = float4(0.0f);
+                if (group >= GROUP_COUNT) {
+                    q_rot[index] = float4(0.0f);
+                    continue;
+                }
                 uint query_head = kv_head * HEAD_REPEATS + repeat;
                 const device T* query_row = queries + ((batch * QUERY_HEADS + query_head) * D);
-                uint index = repeat * GROUPS_PER_LANE + i;
                 q_rot[index] = rotor_rotate_iso_group(
                     float4(
                         static_cast<float>(query_row[base]),
@@ -1127,7 +1237,6 @@ private func makeRotorQuantIsoCompressedBlockKernel() -> MLXFast.MLXFastKernel {
                     key_rotations,
                     group
                 );
-                accum_rot[index] = float4(0.0f);
             }
         }
 
@@ -1140,6 +1249,10 @@ private func makeRotorQuantIsoCompressedBlockKernel() -> MLXFast.MLXFastKernel {
 
             for (uint i = 0; i < GROUPS_PER_LANE; ++i) {
                 uint group = groups[i];
+                if (group >= GROUP_COUNT) {
+                    value_groups[i] = float4(0.0f);
+                    continue;
+                }
                 float4 key_group;
                 if (is_exact_block) {
                     uint base = group << 2;
@@ -1210,6 +1323,9 @@ private func makeRotorQuantIsoCompressedBlockKernel() -> MLXFast.MLXFastKernel {
             uint stats_index = (batch * QUERY_HEADS + query_head) * block_capacity + block;
             device T* partial_row = partial_values + (stats_index * D);
             for (uint i = 0; i < GROUPS_PER_LANE; ++i) {
+                if (groups[i] >= GROUP_COUNT) {
+                    continue;
+                }
                 uint base = groups[i] << 2;
                 uint index = repeat * GROUPS_PER_LANE + i;
                 partial_row[base] = static_cast<T>(accum_rot[index].x);
@@ -1279,7 +1395,8 @@ private func makeRotorQuantIsoBlockReduceKernel() -> MLXFast.MLXFastKernel {
         uint block_capacity = uint(layout[3]);
         uint active_block_count = uint(layout[7]);
 
-        constexpr uint GROUPS_PER_LANE = D / 128;
+        constexpr uint GROUP_COUNT = D / 4;
+        constexpr uint GROUPS_PER_LANE = (GROUP_COUNT + 31) / 32;
         constexpr uint WORK_ITEMS = HEAD_REPEATS * GROUPS_PER_LANE;
         float4 accum_rot[WORK_ITEMS];
         float max_score[HEAD_REPEATS];
@@ -1313,6 +1430,9 @@ private func makeRotorQuantIsoBlockReduceKernel() -> MLXFast.MLXFastKernel {
                 const device T* partial_row = partial_values + (stats_index * D);
 
                 for (uint i = 0; i < GROUPS_PER_LANE; ++i) {
+                    if (groups[i] >= GROUP_COUNT) {
+                        continue;
+                    }
                     uint base = groups[i] << 2;
                     uint index = repeat * GROUPS_PER_LANE + i;
                     float4 block_value = float4(
@@ -1334,6 +1454,9 @@ private func makeRotorQuantIsoBlockReduceKernel() -> MLXFast.MLXFastKernel {
             float inv_sum = 1.0f / max(sum_exp[repeat], 1e-20f);
             for (uint i = 0; i < GROUPS_PER_LANE; ++i) {
                 uint group = groups[i];
+                if (group >= GROUP_COUNT) {
+                    continue;
+                }
                 uint base = group << 2;
                 uint index = repeat * GROUPS_PER_LANE + i;
                 float4 restored = rotor_inverse_rotate_iso_group(accum_rot[index] * inv_sum, value_rotations, group);
@@ -1360,15 +1483,160 @@ private func makeRotorQuantIsoBlockReduceKernel() -> MLXFast.MLXFastKernel {
     )
 }
 
+private let rotorQuantIsoCodecHeader = """
+    uint unpack_rotor_index(const device uint8_t* row, uint value_index, uint bit_width) {
+        uint bit_offset = value_index * bit_width;
+        uint byte_offset = bit_offset >> 3;
+        uint shift = bit_offset & 7;
+        uint word = row[byte_offset];
+        if (shift + bit_width > 8) {
+            word |= uint(row[byte_offset + 1]) << 8;
+        }
+        uint mask = (1u << bit_width) - 1u;
+        return (word >> shift) & mask;
+    }
+
+    float4 rotor_quat_multiply(float4 a, float4 b) {
+        return float4(
+            a.x * b.x - a.y * b.y - a.z * b.z - a.w * b.w,
+            a.x * b.y + a.y * b.x + a.z * b.w - a.w * b.z,
+            a.x * b.z - a.y * b.w + a.z * b.x + a.w * b.y,
+            a.x * b.w + a.y * b.z - a.z * b.y + a.w * b.x
+        );
+    }
+    """
+
+/// Normalizes, rotates, buckets, and bit-packs one cache row per thread. The
+/// MLX-op path in `RotorQuantMSEQuantizer.quantize` materializes a
+/// `[rows, D, levels]` comparison tensor and a uint32 bit stream per flush;
+/// this writes the packed bytes and norms directly.
+private func makeRotorQuantIsoQuantizeKernel() -> MLXFast.MLXFastKernel {
+    let source = """
+        uint row = thread_position_in_grid.x;
+        const device T* x = vectors + row * D;
+
+        float sum_squares = 0.0f;
+        for (uint d = 0; d < D; ++d) {
+            float value = static_cast<float>(x[d]);
+            sum_squares += value * value;
+        }
+        float norm = sqrt(sum_squares);
+        float safe_norm = max(norm, 1e-8f);
+
+        device uint8_t* out = packed + row * PACKED_WIDTH;
+        uint accumulator = 0;
+        uint pending_bits = 0;
+        uint out_index = 0;
+        for (uint group = 0; group < D / 4; ++group) {
+            uint base = group << 2;
+            float4 unit = float4(
+                static_cast<float>(x[base]),
+                static_cast<float>(x[base + 1]),
+                static_cast<float>(x[base + 2]),
+                static_cast<float>(x[base + 3])
+            ) / safe_norm;
+            float4 q = float4(rotations[base], rotations[base + 1], rotations[base + 2], rotations[base + 3]);
+            float4 rotated = rotor_quat_multiply(q, unit);
+            for (uint component = 0; component < 4; ++component) {
+                float value = rotated[component];
+                uint index = 0;
+                for (uint level = 0; level < LEVELS; ++level) {
+                    index += value > boundaries[level] ? 1u : 0u;
+                }
+                // Least-significant bit first, matching `PackedCentroidIndices`.
+                accumulator |= index << pending_bits;
+                pending_bits += BITS;
+                while (pending_bits >= 8) {
+                    out[out_index++] = uint8_t(accumulator & 0xFFu);
+                    accumulator >>= 8;
+                    pending_bits -= 8;
+                }
+            }
+        }
+        if (pending_bits > 0) {
+            out[out_index] = uint8_t(accumulator & 0xFFu);
+        }
+        norms[row] = norm;
+        """
+
+    return MLXFast.metalKernel(
+        name: "rotorquant_iso_quantize",
+        inputNames: ["vectors", "rotations", "boundaries"],
+        outputNames: ["packed", "norms"],
+        source: source,
+        header: rotorQuantIsoCodecHeader
+    )
+}
+
+/// Restores `count` rows of packed storage to dense vectors in one pass and
+/// copies `exact_count` rows of the exact tail after them, so attention reads
+/// one buffer instead of a concatenation of two full-length copies. It reads
+/// the full storage buffers with their capacities as runtime values, so
+/// neither slicing the live rows nor cache growth copies or recompiles.
+private func makeRotorQuantIsoDequantizeKernel() -> MLXFast.MLXFastKernel {
+    let source = """
+        constexpr uint GROUPS = D / 4;
+        uint gid = thread_position_in_grid.x;
+        uint capacity = uint(layout[0]);
+        uint count = uint(layout[1]);
+        uint exact_capacity = uint(layout[2]);
+        uint exact_count = uint(layout[3]);
+        uint total = count + exact_count;
+        uint group = gid % GROUPS;
+        uint row = gid / GROUPS;
+        uint head = row / total;
+        uint token = row - head * total;
+        uint base = group << 2;
+        device T* out_row = output + row * D + base;
+
+        if (token >= count) {
+            auto exact_row = exact + (head * exact_capacity + token - count) * D + base;
+            out_row[0] = exact_row[0];
+            out_row[1] = exact_row[1];
+            out_row[2] = exact_row[2];
+            out_row[3] = exact_row[3];
+            return;
+        }
+
+        uint storage_row = head * capacity + token;
+        const device uint8_t* packed_row = packed + storage_row * PACKED_WIDTH;
+        float4 value = float4(
+            centroids[unpack_rotor_index(packed_row, base, BITS)],
+            centroids[unpack_rotor_index(packed_row, base + 1, BITS)],
+            centroids[unpack_rotor_index(packed_row, base + 2, BITS)],
+            centroids[unpack_rotor_index(packed_row, base + 3, BITS)]
+        ) * norms[storage_row];
+        float4 inverse = float4(rotations[base], -rotations[base + 1], -rotations[base + 2], -rotations[base + 3]);
+        float4 restored = rotor_quat_multiply(inverse, value);
+
+        out_row[0] = static_cast<T>(restored.x);
+        out_row[1] = static_cast<T>(restored.y);
+        out_row[2] = static_cast<T>(restored.z);
+        out_row[3] = static_cast<T>(restored.w);
+        """
+
+    return MLXFast.metalKernel(
+        name: "rotorquant_iso_dequantize",
+        inputNames: ["packed", "norms", "centroids", "rotations", "exact", "layout"],
+        outputNames: ["output"],
+        source: source,
+        header: rotorQuantIsoCodecHeader
+    )
+}
+
 private final class RotorQuantDecodeAttentionKernelManager: Sendable {
     static let shared = RotorQuantDecodeAttentionKernelManager()
 
     let isoCompressedBlockKernel: MLXFast.MLXFastKernel
     let isoBlockReduceKernel: MLXFast.MLXFastKernel
+    let isoQuantizeKernel: MLXFast.MLXFastKernel
+    let isoDequantizeKernel: MLXFast.MLXFastKernel
 
     private init() {
         isoCompressedBlockKernel = makeRotorQuantIsoCompressedBlockKernel()
         isoBlockReduceKernel = makeRotorQuantIsoBlockReduceKernel()
+        isoQuantizeKernel = makeRotorQuantIsoQuantizeKernel()
+        isoDequantizeKernel = makeRotorQuantIsoDequantizeKernel()
     }
 }
 
@@ -1390,6 +1658,9 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
     private var keyDimension: Int?
     private var valueDimension: Int?
     private var originalDType: DType = .float16
+    /// Routes IsoQuant quantize/dequantize through the Metal codec kernels. Tests
+    /// turn it off to compare against the reference MLX-op implementation.
+    var usesCodecKernels = true
 
     public var keyBits: Int { configuration.keyBits }
     public var valueBits: Int { configuration.valueBits }
@@ -1456,7 +1727,7 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
         )
     }
 
-    private func fusedIsoDecodeAttention(
+    func fusedIsoDecodeAttention(
         queries: MLXArray,
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode
@@ -1476,7 +1747,8 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
               valueQuantizer.variant == .iso,
               keyQuantizer.dimension == valueQuantizer.dimension,
               keyQuantizer.dimension == queries.dim(3),
-              [128, 256].contains(keyQuantizer.dimension),
+              keyQuantizer.supportsIsoCodecKernels,
+              keyQuantizer.dimension <= 256,
               queries.dim(1) % max(1, keyIndices?.dim(1) ?? 1) == 0,
               let keyIndices,
               let keyNorms,
@@ -1491,9 +1763,13 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
         let batch = queries.dim(0)
         let queryHeads = queries.dim(1)
         let kvHeads = keyIndices.dim(1)
+        // Each lane keeps HEAD_REPEATS * GROUPS_PER_LANE float4 query and
+        // accumulator registers; cap that product at the D=256, 4-repeat shape.
+        let groupsPerLane = (keyQuantizer.dimension / 4 + 31) / 32
         guard kvHeads > 0,
+              queryHeads >= kvHeads,
               queryHeads % kvHeads == 0,
-              (1 ... 4).contains(queryHeads / kvHeads),
+              queryHeads / kvHeads * groupsPerLane <= 8,
               keyIndices.dim(0) == batch,
               valueIndices.dim(0) == batch,
               exactKeys.dim(0) == batch,
@@ -1685,11 +1961,13 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
                 String(compressedCount),
                 String(exactCount),
                 String(exactBufferSize),
+                configuration.prefillExactLimit.map(String.init) ?? "None",
             ]
         }
         set {
-            guard newValue.count == 14 else {
-                preconditionFailure("RotorQuantKVCache metaState must have exactly 14 values")
+            // Caches saved before the prefill limit existed carry 14 values.
+            guard newValue.count == 14 || newValue.count == 15 else {
+                preconditionFailure("RotorQuantKVCache metaState must have 14 or 15 values")
             }
             step = Int(newValue[0]) ?? step
             offset = Int(newValue[1]) ?? 0
@@ -1704,6 +1982,9 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
             compressedCount = Int(newValue[11]) ?? 0
             exactCount = Int(newValue[12]) ?? 0
             exactBufferSize = Int(newValue[13]) ?? exactBufferSize
+            if newValue.count == 15 {
+                configuration.prefillExactLimit = Int(newValue[14])
+            }
             offset = compressedCount + exactCount
             if let keyDimension, let valueDimension {
                 keyQuantizer = nil
@@ -1741,6 +2022,7 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
 
         let tokenCount = keys.dim(2)
         if tokenCount > 1 {
+            compressPrefillHistoryIfNeeded(incomingTokens: tokenCount)
             appendExact(keys: keys, values: values)
             offset = compressedCount + exactCount
             return
@@ -1786,7 +2068,23 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
         compactExactStorageIfNeeded()
     }
 
-    private func flushOldestExact(tokenCount: Int) {
+    /// Once the cached context plus the incoming chunk would pass
+    /// `prefillExactLimit`, compresses the rows before each chunk, keeping the
+    /// newest `exactBufferSize`. Only rows from earlier updates are compressed, so
+    /// each chunk attends to its own keys exactly, and a context that fits in one
+    /// update, or under the limit, stays exact until decode. The decision uses
+    /// only saved state, so a restored prompt cache compresses like the live one.
+    private func compressPrefillHistoryIfNeeded(incomingTokens: Int) {
+        guard let limit = configuration.prefillExactLimit,
+              offset + incomingTokens > limit,
+              exactCount > exactBufferSize
+        else { return }
+        // Size the tail for the retained rows plus one chunk: later chunks reuse
+        // it without reallocating, and the prefill high-water allocation goes.
+        flushOldestExact(tokenCount: exactCount - exactBufferSize, reservingTokens: incomingTokens)
+    }
+
+    private func flushOldestExact(tokenCount: Int, reservingTokens: Int = 0) {
         guard tokenCount > 0, let exactKeys, let exactValues, exactCount > 0 else { return }
         let flushCount = min(tokenCount, exactCount)
         appendCompressedChunked(
@@ -1801,7 +2099,7 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
                 exactValues[.ellipsis, flushCount..<exactCount, 0...]
         }
         self.exactCount = retained
-        compactExactStorageIfNeeded()
+        compactExactStorageIfNeeded(reservingTokens: reservingTokens)
     }
 
     private func appendCompressed(keys: MLXArray, values: MLXArray) {
@@ -1809,21 +2107,31 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
         let previous = compressedCount
         ensureStorage(batch: keys.dim(0), kvHeads: keys.dim(1), tokenCount: keys.dim(2))
 
-        let quantizedKeys = keyQuantizer!.quantize(keys)
-        let quantizedValues = valueQuantizer!.quantize(values)
-        let packedKeyIndices = PackedCentroidIndices.pack(quantizedKeys.indices, bitWidth: configuration.keyBits)
-        let packedValueIndices = PackedCentroidIndices.pack(quantizedValues.indices, bitWidth: configuration.valueBits)
+        let quantizedKeys = keyQuantizer!.quantizePacked(keys, useKernels: usesCodecKernels)
+        let quantizedValues = valueQuantizer!.quantizePacked(values, useKernels: usesCodecKernels)
 
         compressedCount += keys.dim(2)
-        keyIndices?[.ellipsis, previous..<compressedCount, 0...] = packedKeyIndices
+        keyIndices?[.ellipsis, previous..<compressedCount, 0...] = quantizedKeys.packed
         keyNorms?[.ellipsis, previous..<compressedCount] = quantizedKeys.norms
-        valueIndices?[.ellipsis, previous..<compressedCount, 0...] = packedValueIndices
+        valueIndices?[.ellipsis, previous..<compressedCount, 0...] = quantizedValues.packed
         valueNorms?[.ellipsis, previous..<compressedCount] = quantizedValues.norms
     }
 
     private func appendCompressedChunked(keys: MLXArray, values: MLXArray) {
         guard keys.dim(2) > 0 else { return }
-        let chunkTokens = max(16, min(64, step / 4))
+        // Size storage for the whole flush up front. Growing per chunk
+        // reallocated and copied the compressed cache several times during the
+        // first decode step after a long prompt.
+        ensureStorage(batch: keys.dim(0), kvHeads: keys.dim(1), tokenCount: keys.dim(2))
+        // The codec kernels have no per-row intermediates, but they copy their
+        // strided exact-buffer slice to a contiguous input; bounded chunks keep
+        // that copy small when the first decode flushes a long dense prompt.
+        // The MLX-op path needs smaller chunks to bound its comparison tensors.
+        let usesKernels =
+            usesCodecKernels
+            && keyQuantizer?.supportsIsoCodecKernels == true
+            && valueQuantizer?.supportsIsoCodecKernels == true
+        let chunkTokens = usesKernels ? 256 : max(16, min(64, step / 4))
         if keys.dim(2) <= chunkTokens {
             appendCompressed(keys: keys, values: values)
             return
@@ -1962,11 +2270,11 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
     /// Releases the dense prefill backing allocation after older rows have moved into
     /// compressed storage. Keeping `exactCapacity` at its prefill high-water mark retains
     /// the entire dense prompt alongside the compressed cache and defeats the RAM saving.
-    private func compactExactStorageIfNeeded() {
+    private func compactExactStorageIfNeeded(reservingTokens: Int = 0) {
         guard let exactKeys, let exactValues, let keyDimension, let valueDimension else { return }
         // Preserve the existing flush slack so decode does not reallocate this
         // buffer one token at a time after compaction.
-        let targetCapacity = max(exactBufferSize + exactFlushSlack, exactCount, 1)
+        let targetCapacity = max(exactBufferSize + exactFlushSlack, exactCount + reservingTokens, 1)
         guard exactKeys.dim(2) > targetCapacity || exactValues.dim(2) > targetCapacity else {
             exactCapacity = targetCapacity
             return
@@ -1982,10 +2290,7 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
         )
     }
 
-    private func currentFallbackState() -> (MLXArray, MLXArray) {
-        var allKeys: [MLXArray] = []
-        var allValues: [MLXArray] = []
-
+    func currentFallbackState() -> (MLXArray, MLXArray) {
         if compressedCount > 0 {
             guard let keyQuantizer,
                   let valueQuantizer,
@@ -1996,45 +2301,37 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
             else {
                 preconditionFailure("RotorQuant compressed state is incomplete")
             }
-            let unpackedKeyIndices = PackedCentroidIndices.unpack(
-                keyIndices[.ellipsis, ..<compressedCount, 0...],
-                bitWidth: configuration.keyBits,
-                valueCount: keyQuantizer.storageDimension
+            // The exact tail goes into the same output so attention never holds
+            // the restored history and a concatenated copy of it at once.
+            let tailCount = exactCount
+            let keyTail = tailCount > 0 ? exactKeys.map { (storage: $0, count: tailCount) } : nil
+            let valueTail = tailCount > 0 ? exactValues.map { (storage: $0, count: tailCount) } : nil
+            let keys = keyQuantizer.dequantizePacked(
+                storage: keyIndices,
+                norms: keyNorms,
+                count: compressedCount,
+                dtype: originalDType,
+                useKernels: usesCodecKernels,
+                exactTail: keyTail
             )
-            let unpackedValueIndices = PackedCentroidIndices.unpack(
-                valueIndices[.ellipsis, ..<compressedCount, 0...],
-                bitWidth: configuration.valueBits,
-                valueCount: valueQuantizer.storageDimension
+            let values = valueQuantizer.dequantizePacked(
+                storage: valueIndices,
+                norms: valueNorms,
+                count: compressedCount,
+                dtype: originalDType,
+                useKernels: usesCodecKernels,
+                exactTail: valueTail
             )
-            allKeys.append(
-                keyQuantizer.dequantize(
-                    indices: unpackedKeyIndices,
-                    norms: keyNorms[.ellipsis, ..<compressedCount],
-                    dtype: originalDType
-                )
-            )
-            allValues.append(
-                valueQuantizer.dequantize(
-                    indices: unpackedValueIndices,
-                    norms: valueNorms[.ellipsis, ..<compressedCount],
-                    dtype: originalDType
-                )
-            )
+            return (keys, values)
         }
 
-        if let exactKeys, let exactValues, exactCount > 0 {
-            allKeys.append(castIfNeeded(exactKeys[.ellipsis, ..<exactCount, 0...], to: originalDType))
-            allValues.append(castIfNeeded(exactValues[.ellipsis, ..<exactCount, 0...], to: originalDType))
-        }
-
-        guard let firstKeys = allKeys.first, let firstValues = allValues.first else {
+        guard let exactKeys, let exactValues, exactCount > 0 else {
             preconditionFailure("RotorQuantKVCache is empty")
         }
-
-        if allKeys.count == 1 {
-            return (firstKeys, firstValues)
-        }
-        return (concatenated(allKeys, axis: 2), concatenated(allValues, axis: 2))
+        return (
+            castIfNeeded(exactKeys[.ellipsis, ..<exactCount, 0...], to: originalDType),
+            castIfNeeded(exactValues[.ellipsis, ..<exactCount, 0...], to: originalDType)
+        )
     }
 
     private static func dtypeName(_ dtype: DType) -> String {
@@ -2968,8 +3265,8 @@ public func loadPromptCache(
 }
 
 private func validateRotorQuantPromptCache(state: [MLXArray], metaState: [String]) throws {
-    guard metaState.count == 14 else {
-        throw KVCacheError(message: "Invalid RotorQuantKVCache metaState - expected 14 values")
+    guard metaState.count == 14 || metaState.count == 15 else {
+        throw KVCacheError(message: "Invalid RotorQuantKVCache metaState - expected 14 or 15 values")
     }
 
     guard [0, 2, 4, 6].contains(state.count) else {
@@ -3035,6 +3332,11 @@ private func validateRotorQuantPromptCache(state: [MLXArray], metaState: [String
     let compressedCount = try parseInt(11, "compressed count")
     let exactCount = try parseInt(12, "exact count")
     let exactBufferSize = try parseInt(13, "exact buffer size")
+    if metaState.count == 15, metaState[14] != "None" {
+        guard let prefillExactLimit = Int(metaState[14]), prefillExactLimit >= 0 else {
+            throw KVCacheError(message: "Invalid RotorQuantKVCache prefill exact limit")
+        }
+    }
 
     guard step > 0,
           (1 ... 8).contains(keyBits),
@@ -3276,10 +3578,11 @@ public func makePromptCacheWithLayerCount(
 
 /// Create a per-layer cache instance for the given generation parameters.
 ///
-/// RotorQuant must start at cache construction time to reduce the peak
-/// memory footprint during prompt prefill. If we wait to swap in a compressed
-/// cache after a generation step, the large temporary KV allocation has
-/// already happened and long-context crashes occur at the same boundary.
+/// RotorQuant must start at cache construction time. Prefill rows stay dense
+/// until the first decode step unless the configuration sets
+/// `prefillExactLimit`, which compresses earlier chunks of a long prompt and
+/// bounds the dense KV peak. Swapping in a compressed cache after generation
+/// starts would not help: the full dense allocation has already happened.
 public func makeLayerKVCache(
     parameters: GenerateParameters?,
     layerIndex: Int = 0

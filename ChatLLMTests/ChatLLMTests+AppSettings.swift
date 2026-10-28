@@ -51,6 +51,7 @@ extension ChatLLMTests {
         #expect(rotorConfiguration.valueBits == 2)
         #expect(rotorConfiguration.exactBufferSize == 128)
         #expect(rotorConfiguration.attentionBlockTokens == 128)
+        #expect(rotorConfiguration.prefillExactLimit == 4096)
     }
 
     @Test func generationConfigurationUsesMediaTunedRotorQuantProfile() {
@@ -76,6 +77,7 @@ extension ChatLLMTests {
         #expect(rotorConfiguration.valueBits == 2)
         #expect(rotorConfiguration.exactBufferSize == 32)
         #expect(rotorConfiguration.attentionBlockTokens == 64)
+        #expect(rotorConfiguration.prefillExactLimit == 4096)
     }
 
     @Test func userDefaultsRotorQuantDefaultsToEnabledWhenUnset() {

@@ -64,6 +64,13 @@ public struct RotorQuantConfiguration: Sendable, Equatable {
     public var exactBufferSize: Int
     public var attentionBlockTokens: Int
     public var variant: RotorQuantVariant
+    /// Context length, in cached tokens, above which prefill compresses as it
+    /// goes. When the cached tokens plus an incoming chunk would pass this
+    /// limit, the rows before that chunk are compressed, keeping the newest
+    /// `exactBufferSize`, so a long prompt no longer holds its whole dense KV
+    /// until the first decode. Those chunks attend to compressed history.
+    /// `nil` keeps every prefill row exact until decode.
+    public var prefillExactLimit: Int?
 
     public init(
         keyBits: Int = 3,
@@ -71,7 +78,8 @@ public struct RotorQuantConfiguration: Sendable, Equatable {
         seed: UInt64 = 42,
         exactBufferSize: Int = 128,
         attentionBlockTokens: Int = 128,
-        variant: RotorQuantVariant = .iso
+        variant: RotorQuantVariant = .iso,
+        prefillExactLimit: Int? = nil
     ) {
         self.keyBits = keyBits
         self.valueBits = valueBits
@@ -79,6 +87,7 @@ public struct RotorQuantConfiguration: Sendable, Equatable {
         self.exactBufferSize = exactBufferSize
         self.attentionBlockTokens = attentionBlockTokens
         self.variant = variant
+        self.prefillExactLimit = prefillExactLimit
     }
 
     public func configurationForLayer(_ layerIndex: Int) -> RotorQuantConfiguration {

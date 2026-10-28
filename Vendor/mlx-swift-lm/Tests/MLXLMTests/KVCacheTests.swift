@@ -171,8 +171,11 @@ struct KVCacheTests {
         #expect(runtimeArrays[5].dim(2) == 3)
     }
 
-    @Test(arguments: [128, 256])
-    func testRotorQuantFusedDecodeAttentionMatchesDequantizedFallback(headDimension: Int) {
+    // (64, 8) is LFM2.5's attention geometry; (128, 8) covers 8-way GQA.
+    @Test(arguments: zip([64, 128, 128, 256], [8, 4, 8, 4]))
+    func testRotorQuantFusedDecodeAttentionMatchesDequantizedFallback(
+        headDimension: Int, queryHeads: Int
+    ) {
         // Several compressed blocks plus a multi-block exact tail exercise the
         // block-parallel decode kernel, including exact-tail blocks.
         let configuration = RotorQuantConfiguration(
@@ -186,7 +189,6 @@ struct KVCacheTests {
         let fusedCache = RotorQuantKVCache(configuration: configuration)
         let fallbackCache = RotorQuantKVCache(configuration: configuration)
         let kvHeads = 2
-        let queryHeads = 4
         let scale = 1 / Float(headDimension).squareRoot()
 
         let prefillKeys = patternedArray(shape: [1, kvHeads, 200, headDimension], scale: 1)
@@ -200,8 +202,15 @@ struct KVCacheTests {
             let values = patternedArray(shape: [1, kvHeads, 1, headDimension], scale: 0.5 - offset * 0.01)
             let queries = patternedArray(shape: [1, queryHeads, 1, headDimension], scale: 1 + offset * 0.05)
 
-            let fused = fusedCache.attention(
-                queries: queries, keys: keys, values: values, scale: scale, mask: .none)
+            // Call the kernel directly: `attention` silently falls back to
+            // dequantized SDPA, which would match the reference trivially.
+            _ = fusedCache.update(keys: keys, values: values)
+            guard let fused = fusedCache.fusedIsoDecodeAttention(
+                queries: queries, scale: scale, mask: .none)
+            else {
+                Issue.record("Fused decode attention declined D=\(headDimension) queryHeads=\(queryHeads)")
+                return
+            }
             let (fallbackKeys, fallbackValues) = fallbackCache.update(keys: keys, values: values)
             let reference = MLXFast.scaledDotProductAttention(
                 queries: queries, keys: fallbackKeys, values: fallbackValues,
@@ -210,6 +219,286 @@ struct KVCacheTests {
             #expect(fused.shape == reference.shape)
             #expect(maxAbsoluteDifference(fused, reference) < 2e-2)
         }
+    }
+
+    @Test(arguments: zip([64, 128, 256, 128], [(3, 2), (3, 2), (3, 2), (8, 4)]))
+    func testRotorQuantCodecKernelsMatchReferenceQuantization(
+        headDimension: Int, bits: (Int, Int)
+    ) {
+        let configuration = RotorQuantConfiguration(
+            keyBits: bits.0,
+            valueBits: bits.1,
+            seed: 42,
+            exactBufferSize: 0,
+            attentionBlockTokens: 64,
+            variant: .iso
+        )
+        let kernelCache = RotorQuantKVCache(configuration: configuration)
+        let referenceCache = RotorQuantKVCache(configuration: configuration)
+        referenceCache.usesCodecKernels = false
+
+        // An exact prefill followed by a decode token flushes every row through
+        // the quantizer, including more rows than one MLX-op chunk.
+        let prefillKeys = patternedArray(shape: [1, 2, 90, headDimension], scale: 1)
+        let prefillValues = patternedArray(shape: [1, 2, 90, headDimension], scale: 0.5)
+        let decodeKeys = patternedArray(shape: [1, 2, 1, headDimension], scale: 0.7)
+        let decodeValues = patternedArray(shape: [1, 2, 1, headDimension], scale: 0.3)
+        for cache in [kernelCache, referenceCache] {
+            _ = cache.update(keys: prefillKeys, values: prefillValues)
+        }
+        let (kernelKeys, kernelValues) = kernelCache.update(keys: decodeKeys, values: decodeValues)
+        let (referenceKeys, referenceValues) = referenceCache.update(
+            keys: decodeKeys, values: decodeValues)
+
+        let kernelState = kernelCache.state
+        let referenceState = referenceCache.state
+        #expect(kernelState.count == 4)
+        #expect(kernelState.map(\.shape) == referenceState.map(\.shape))
+        // Rotations accumulate in a different order than the MLX ops, so a
+        // value sitting on a bucket boundary may land one bucket over.
+        for packedIndex in [0, 2] {
+            let kernelBytes = kernelState[packedIndex].asArray(UInt8.self)
+            let referenceBytes = referenceState[packedIndex].asArray(UInt8.self)
+            let mismatches = zip(kernelBytes, referenceBytes).filter { $0 != $1 }.count
+            #expect(Double(mismatches) <= Double(kernelBytes.count) * 0.01)
+        }
+        #expect(maxAbsoluteDifference(kernelState[1], referenceState[1]) < 1e-3)
+        #expect(maxAbsoluteDifference(kernelState[3], referenceState[3]) < 1e-3)
+
+        // Kernel dequantization of the kernel-packed rows must match the
+        // reference MLX-op dequantization of the same rows.
+        referenceCache.state = kernelState
+        let (crossKeys, crossValues) = referenceCache.currentFallbackState()
+        #expect(kernelKeys.shape == [1, 2, 91, headDimension])
+        #expect(maxAbsoluteDifference(kernelKeys, crossKeys) < 2e-3)
+        #expect(maxAbsoluteDifference(kernelValues, crossValues) < 2e-3)
+        #expect(referenceKeys.shape == kernelKeys.shape)
+        #expect(referenceValues.shape == kernelValues.shape)
+    }
+
+    @Test
+    func testRotorQuantDecodeFlushAllocatesCompressedStorageOnce() {
+        let cache = RotorQuantKVCache(
+            configuration: RotorQuantConfiguration(
+                keyBits: 3,
+                valueBits: 2,
+                seed: 42,
+                exactBufferSize: 16,
+                attentionBlockTokens: 64,
+                variant: .iso
+            )
+        )
+        _ = cache.update(
+            keys: patternedArray(shape: [1, 1, 1_000, 128]),
+            values: patternedArray(shape: [1, 1, 1_000, 128])
+        )
+        _ = cache.update(
+            keys: patternedArray(shape: [1, 1, 1, 128]),
+            values: patternedArray(shape: [1, 1, 1, 128])
+        )
+
+        // 985 flushed rows fit one 1,024-row allocation. Growing per 64-row
+        // chunk stepped through 512, 768, and 1,152 rows instead.
+        #expect(cache.metaState[11] == "985")
+        #expect(cache.innerState()[0].dim(2) == 1_024)
+    }
+
+    private func prefillLimitedRotorCache(limit: Int?) -> RotorQuantKVCache {
+        RotorQuantKVCache(
+            configuration: RotorQuantConfiguration(
+                keyBits: 3,
+                valueBits: 2,
+                seed: 42,
+                exactBufferSize: 16,
+                attentionBlockTokens: 64,
+                variant: .iso,
+                prefillExactLimit: limit
+            )
+        )
+    }
+
+    @Test
+    func testRotorQuantPrefillExactLimitKeepsShortPromptsExact() {
+        let cache = prefillLimitedRotorCache(limit: 64)
+        let keys = patternedArray(shape: [1, 2, 64, 128])
+        let values = patternedArray(shape: [1, 2, 64, 128], scale: 0.014)
+
+        _ = cache.update(keys: keys[.ellipsis, ..<32, 0...], values: values[.ellipsis, ..<32, 0...])
+        let (cachedKeys, cachedValues) = cache.update(
+            keys: keys[.ellipsis, 32..., 0...],
+            values: values[.ellipsis, 32..., 0...]
+        )
+
+        #expect(cache.state.count == 2)
+        #expect(cache.metaState[11] == "0")
+        #expect(maxAbsoluteDifference(cachedKeys, keys) == 0)
+        #expect(maxAbsoluteDifference(cachedValues, values) == 0)
+    }
+
+    @Test
+    func testRotorQuantPrefillExactLimitCompressesEarlierChunksOfLongPrompts() {
+        let cache = prefillLimitedRotorCache(limit: 64)
+        let keys = patternedArray(shape: [1, 2, 128, 128])
+        let values = patternedArray(shape: [1, 2, 128, 128], scale: 0.014)
+
+        func chunk(_ index: Int) -> (MLXArray, MLXArray) {
+            let range = (index * 32) ..< ((index + 1) * 32)
+            return (keys[.ellipsis, range, 0...], values[.ellipsis, range, 0...])
+        }
+
+        for index in 0 ..< 2 {
+            let (chunkKeys, chunkValues) = chunk(index)
+            _ = cache.update(keys: chunkKeys, values: chunkValues)
+        }
+        #expect(cache.metaState[11] == "0")
+
+        // 64 exact rows plus a 32-row chunk pass the limit: the oldest 48 rows
+        // compress, the newest 16 and the whole incoming chunk stay exact.
+        let (thirdKeys, thirdValues) = chunk(2)
+        let (cachedKeys, cachedValues) = cache.update(keys: thirdKeys, values: thirdValues)
+        #expect(cache.metaState[11] == "48")
+        #expect(cache.metaState[12] == "48")
+        #expect(cache.offset == 96)
+        #expect(cachedKeys.dim(2) == 96)
+        #expect(
+            maxAbsoluteDifference(cachedKeys[.ellipsis, 48..., 0...], keys[.ellipsis, 48 ..< 96, 0...]) == 0
+        )
+        #expect(
+            maxAbsoluteDifference(cachedValues[.ellipsis, 48..., 0...], values[.ellipsis, 48 ..< 96, 0...]) == 0
+        )
+        #expect(maxAbsoluteDifference(cachedKeys[.ellipsis, ..<48, 0...], keys[.ellipsis, ..<48, 0...]) > 0)
+
+        // The tail drops its 64-row high-water allocation to the 16 retained
+        // rows plus one chunk.
+        #expect(cache.innerState()[4].dim(2) == 48)
+
+        // Once past the limit, every later chunk compresses the rows before it.
+        let (fourthKeys, fourthValues) = chunk(3)
+        _ = cache.update(keys: fourthKeys, values: fourthValues)
+        #expect(cache.metaState[11] == "80")
+        #expect(cache.metaState[12] == "48")
+        #expect(cache.innerState()[4].dim(2) == 48)
+
+        _ = cache.update(
+            keys: patternedArray(shape: [1, 2, 1, 128], scale: 0.02),
+            values: patternedArray(shape: [1, 2, 1, 128], scale: 0.02)
+        )
+        // The first decode flush trims the tail back to the decode buffer.
+        #expect(cache.metaState[11] == "113")
+        #expect(cache.metaState[12] == "16")
+        #expect(cache.innerState()[4].dim(2) == 18)
+    }
+
+    @Test
+    func testRotorQuantPrefillExactLimitCompressesRestoredCachesLikeLiveOnes() {
+        let live = prefillLimitedRotorCache(limit: 64)
+        let keys = patternedArray(shape: [1, 2, 128, 128])
+        let values = patternedArray(shape: [1, 2, 128, 128], scale: 0.014)
+        for start in stride(from: 0, to: 128, by: 32) {
+            let range = start ..< (start + 32)
+            _ = live.update(keys: keys[.ellipsis, range, 0...], values: values[.ellipsis, range, 0...])
+        }
+        #expect(live.metaState[11] == "80")
+        let restored = prefillLimitedRotorCache(limit: nil)
+        restored.state = live.state
+        restored.metaState = live.metaState
+
+        // A prompt prefix is prefilled without a decode step, then the rest of
+        // the prompt continues on either the live cache or one restored from disk.
+        let nextKeys = patternedArray(shape: [1, 2, 8, 128], scale: 0.02)
+        let nextValues = patternedArray(shape: [1, 2, 8, 128], scale: 0.02)
+        let (liveKeys, _) = live.update(keys: nextKeys, values: nextValues)
+        let (restoredKeys, _) = restored.update(keys: nextKeys, values: nextValues)
+
+        #expect(live.metaState == restored.metaState)
+        #expect(maxAbsoluteDifference(liveKeys, restoredKeys) == 0)
+    }
+
+    @Test
+    func testRotorQuantPrefillExactLimitAttentionStaysCloseToExactAttention() {
+        let cache = prefillLimitedRotorCache(limit: 64)
+        let keys = patternedArray(shape: [1, 2, 128, 128])
+        let values = patternedArray(shape: [1, 2, 128, 128], scale: 0.014)
+        let queries = patternedArray(shape: [1, 4, 128, 128], scale: 0.03)
+        let scale = 1 / Float(128).squareRoot()
+
+        var output: MLXArray?
+        for start in stride(from: 0, to: 128, by: 32) {
+            let range = start ..< (start + 32)
+            output = cache.attention(
+                queries: queries[.ellipsis, range, 0...],
+                keys: keys[.ellipsis, range, 0...],
+                values: values[.ellipsis, range, 0...],
+                scale: scale,
+                mask: .causal
+            )
+        }
+        #expect(cache.metaState[11] == "80")
+
+        let reference = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: scale,
+            mask: .causal
+        )[.ellipsis, 96..., 0...]
+        guard let output else {
+            Issue.record("Expected attention output")
+            return
+        }
+        #expect(output.shape == reference.shape)
+        #expect(maxAbsoluteDifference(output, reference) < 0.05)
+    }
+
+    @Test
+    func testRotorQuantPrefillExactLimitSurvivesPromptCacheRoundTrip() throws {
+        let cache = prefillLimitedRotorCache(limit: 4_096)
+        _ = cache.update(
+            keys: patternedArray(shape: [1, 2, 8, 128]),
+            values: patternedArray(shape: [1, 2, 8, 128])
+        )
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try savePromptCache(url: url, cache: [cache], metadata: [:])
+        let (loaded, _) = try loadPromptCache(url: url)
+
+        let restored = try #require(loaded.first as? RotorQuantKVCache)
+        #expect(restored.configuration.prefillExactLimit == 4_096)
+        #expect(restored.metaState == cache.metaState)
+    }
+
+    @Test
+    func testRotorQuantPromptCacheWithoutPrefillLimitStillLoads() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // The 14-value layout written before `prefillExactLimit` existed.
+        let legacyMetaState = [
+            "256", "1", "3", "2", "42", "128", "iso",
+            "iso", "128", "128", "float16", "0", "1", "128",
+        ]
+        var metadata: [String: String] = ["2.0": "RotorQuantKVCache"]
+        for (index, value) in legacyMetaState.enumerated() {
+            metadata["0.0.\(index)"] = value
+        }
+        try save(
+            arrays: [
+                "0.0": MLXArray.zeros([1, 1, 1, 128], dtype: .float16),
+                "0.1": MLXArray.zeros([1, 1, 1, 128], dtype: .float16),
+            ],
+            metadata: metadata,
+            url: url
+        )
+
+        let (loaded, _) = try loadPromptCache(url: url)
+
+        let restored = try #require(loaded.first as? RotorQuantKVCache)
+        #expect(restored.configuration.prefillExactLimit == nil)
+        #expect(restored.offset == 1)
     }
 
     @Test

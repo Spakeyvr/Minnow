@@ -52,7 +52,27 @@ Decode throughput patches in `mlx-swift-lm`:
   the vocabulary with a rank array rebuilt on the CPU every token;
 - RotorQuant decode attention spreads the exact (unquantized) tail across
   parallel blocks instead of one SIMD group per KV head, and passes buffer
-  capacities at runtime so cache growth does not compile new Metal pipelines.
+  capacities at runtime so cache growth does not compile new Metal pipelines;
+- the fused RotorQuant decode kernel accepts any IsoQuant head dimension that
+  is a multiple of 4 up to 256, and up to 8-way GQA at D <= 128. Upstream's
+  128/256-only guard sent LFM2.5 (D=64) through a full dequantize of the
+  compressed history on every token;
+- IsoQuant quantize/pack and unpack/dequantize run as Metal kernels instead
+  of MLX-op chains whose uint32 bit-stream intermediates were many times the
+  dense KV size, and a flush sizes compressed storage once instead of per
+  64-row chunk. This removes the first-decode stall after a long prompt and
+  the transient spike when a later turn's prefill reads compressed history;
+- the unpack kernel writes the exact tail after the restored rows, so
+  attention over compressed history no longer holds a second, concatenated
+  copy. Its read of the tail also orders each layer's restore after the layer
+  before it, so MLX does not restore every layer's history at once;
+- `RotorQuantConfiguration.prefillExactLimit` (ChatLLM uses 4,096 tokens)
+  compresses the rows before each prefill chunk once the cached context passes
+  the limit, keeping the newest `exactBufferSize` rows exact. The decision uses
+  only saved state, so a restored prompt prefix compresses like the live cache.
+  Upstream kept the whole prompt dense until the first decode. Chunks past the
+  limit attend to compressed history. The limit is saved as an optional 15th `metaState` value,
+  and 14-value prompt caches still load.
 
 Prompt-cache patches in `mlx-swift-lm`:
 

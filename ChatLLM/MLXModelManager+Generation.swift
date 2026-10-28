@@ -21,6 +21,9 @@ extension MLXModelManager {
     nonisolated private static let rotorQuantAttentionBlockTokens = 128
     nonisolated private static let rotorQuantMediaExactBufferSize = 32
     nonisolated private static let rotorQuantMediaAttentionBlockTokens = 64
+    /// Prompts longer than this compress their earlier prefill chunks, trading a
+    /// little prompt fidelity for a bounded dense KV peak. Shorter prompts stay exact.
+    nonisolated private static let rotorQuantPrefillExactLimit = 4096
     nonisolated private static let memoryConstrainedMaxKVSize = 4096
     nonisolated internal static func promptTokenCountFingerprint(
         role: Chat.Message.Role,
@@ -347,7 +350,8 @@ extension MLXModelManager {
                     seed: rotorQuantSeed,
                     exactBufferSize: exactBufferSize,
                     attentionBlockTokens: attentionBlockTokens,
-                    variant: .iso
+                    variant: .iso,
+                    prefillExactLimit: rotorQuantPrefillExactLimit
                 )
             )
         }

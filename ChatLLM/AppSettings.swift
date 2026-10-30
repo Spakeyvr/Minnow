@@ -17,6 +17,8 @@ nonisolated enum AppSettingsKeys {
     static let autoDeleteDays = "autoDeleteDays"
     static let developerModeEnabled = "developerModeEnabled"
     static let disableRAMPrecautions = "disableRAMPrecautions"
+    static let forcePersistentKVCache = "forcePersistentKVCache"
+    static let overrideContextWindowLimit = "overrideContextWindowLimit"
     static let disableToolCalls = "disableToolCalls"
     static let selectedLLMBackend = "selectedLLMBackend"
     static let selectedCustomModelID = "selectedCustomModelID"
@@ -40,6 +42,8 @@ struct AppSettingsDraft: Equatable {
     var autoDeleteDays: Int
     var developerModeEnabled: Bool
     var disableRAMPrecautions: Bool
+    var forcePersistentKVCache: Bool
+    var overrideContextWindowLimit: Bool
     var disableToolCalls: Bool
 
     static func load(from defaults: UserDefaults = .standard) -> Self {
@@ -64,6 +68,8 @@ struct AppSettingsDraft: Equatable {
             autoDeleteDays: defaults.object(forKey: AppSettingsKeys.autoDeleteDays) as? Int ?? 30,
             developerModeEnabled: defaults.bool(forKey: AppSettingsKeys.developerModeEnabled),
             disableRAMPrecautions: defaults.bool(forKey: AppSettingsKeys.disableRAMPrecautions),
+            forcePersistentKVCache: defaults.bool(forKey: AppSettingsKeys.forcePersistentKVCache),
+            overrideContextWindowLimit: defaults.bool(forKey: AppSettingsKeys.overrideContextWindowLimit),
             disableToolCalls: defaults.bool(forKey: AppSettingsKeys.disableToolCalls)
         )
     }
@@ -86,6 +92,8 @@ struct AppSettingsDraft: Equatable {
             autoDeleteDays: 30,
             developerModeEnabled: false,
             disableRAMPrecautions: false,
+            forcePersistentKVCache: false,
+            overrideContextWindowLimit: false,
             disableToolCalls: false
         )
     }
@@ -142,6 +150,12 @@ struct AppSettingsDraft: Equatable {
         }
         if previous?.disableRAMPrecautions != disableRAMPrecautions {
             defaults.set(disableRAMPrecautions, forKey: AppSettingsKeys.disableRAMPrecautions)
+        }
+        if previous?.forcePersistentKVCache != forcePersistentKVCache {
+            defaults.set(forcePersistentKVCache, forKey: AppSettingsKeys.forcePersistentKVCache)
+        }
+        if previous?.overrideContextWindowLimit != overrideContextWindowLimit {
+            defaults.set(overrideContextWindowLimit, forKey: AppSettingsKeys.overrideContextWindowLimit)
         }
         if previous?.disableToolCalls != disableToolCalls {
             defaults.disableToolCalls = disableToolCalls

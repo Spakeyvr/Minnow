@@ -203,7 +203,8 @@ extension MLXModelManager {
             memoryConstrained: false,
             prefersBoundedCache: prefersBoundedKVCacheAcrossTurns,
             configuredMaxOutputTokens: defaults.mlxMaxOutputTokensLimit,
-            configuredContextWindow: configuredContextWindowLimit(for: model)
+            configuredContextWindow: configuredContextWindowLimit(for: model),
+            contextWindowLimitRaised: defaults.bool(forKey: AppSettingsKeys.overrideContextWindowLimit)
         )
     }
 

@@ -14,8 +14,11 @@ extension MLXModelManager {
     // MARK: - Generation
 
     nonisolated private static let maximumPromptTokenCountCacheEntries = 256
-    nonisolated private static let rotorQuantKeyBits = 3
-    nonisolated private static let rotorQuantValueBits = 2
+    /// 4-bit keys and values. With 3-bit keys or 2- or 3-bit values, LFM2.5
+    /// looped instead of answering after a 10K-token prompt; 4/4 matched the
+    /// uncompressed answer and still keeps the KV about 3.5x smaller.
+    nonisolated private static let rotorQuantKeyBits = 4
+    nonisolated private static let rotorQuantValueBits = 4
     nonisolated private static let rotorQuantSeed: UInt64 = 42
     nonisolated private static let rotorQuantExactBufferSize = 128
     nonisolated private static let rotorQuantAttentionBlockTokens = 128
@@ -104,8 +107,11 @@ extension MLXModelManager {
         }
 
     }
+    /// Devices under 12 GB use a sliding window unless the Developer setting
+    /// keeps the full (RotorQuant-eligible) cache.
     var prefersBoundedKVCacheAcrossTurns: Bool {
         deviceSupportProfile.hasLowMemoryForPersistentKVCache
+            && !defaults.bool(forKey: AppSettingsKeys.forcePersistentKVCache)
     }
 
     func configuredContextWindowLimit(for model: MLXModelInfo? = nil) -> Int {
@@ -149,7 +155,8 @@ extension MLXModelManager {
             memoryConstrained: memoryConstrained,
             prefersBoundedCache: prefersBoundedKVCacheAcrossTurns,
             configuredMaxOutputTokens: configuredMaxOutputTokens,
-            configuredContextWindow: configuredContextWindow
+            configuredContextWindow: configuredContextWindow,
+            contextWindowLimitRaised: defaults.bool(forKey: AppSettingsKeys.overrideContextWindowLimit)
         )
         if deferredPrewarmModelID == currentModel.id && !memoryConstrained {
             await prewarmModelShaders(for: currentModel, reason: "first-generation")
@@ -262,7 +269,8 @@ extension MLXModelManager {
         memoryConstrained: Bool,
         prefersBoundedCache: Bool,
         configuredMaxOutputTokens: Int?,
-        configuredContextWindow: Int
+        configuredContextWindow: Int,
+        contextWindowLimitRaised: Bool = false
     ) -> GenerationConfiguration {
         let maxTokens: Int? = if hasTools {
             configuredMaxOutputTokens.map { min($0, 4096) } ?? 4096
@@ -279,7 +287,8 @@ extension MLXModelManager {
         )
         let clampedCachePolicy = clampedCachePolicy(
             cachePolicy,
-            configuredContextWindow: configuredContextWindow
+            configuredContextWindow: configuredContextWindow,
+            contextWindowLimitRaised: contextWindowLimitRaised
         )
         return GenerationConfiguration(
             maxTokens: maxTokens,
@@ -318,13 +327,19 @@ extension MLXModelManager {
         return .persistentSimple
     }
 
+    /// The sliding window never outgrows the context window. While the
+    /// Developer override raises the context limit it matches the window, so
+    /// a prompt budgeted past 4,096 tokens is not evicted during prefill.
     nonisolated private static func clampedCachePolicy(
         _ cachePolicy: MLXCachePolicy,
-        configuredContextWindow: Int
+        configuredContextWindow: Int,
+        contextWindowLimitRaised: Bool
     ) -> MLXCachePolicy {
         switch cachePolicy {
         case .boundedRotating(let maxKVSize):
-            return .boundedRotating(maxKVSize: min(maxKVSize, configuredContextWindow))
+            return .boundedRotating(maxKVSize: contextWindowLimitRaised
+                ? configuredContextWindow
+                : min(maxKVSize, configuredContextWindow))
         case .persistentSimple, .persistentRotorQuant:
             return cachePolicy
         }

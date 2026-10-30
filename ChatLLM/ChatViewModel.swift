@@ -176,6 +176,16 @@ final class ChatViewModel: ObservableObject {
     // Covers a Tavily search including its retry (see TavilySearchService:
     // two 15 s requests plus a bounded Retry-After wait).
     private let webSearchTimeout: Duration = .seconds(60)
+    /// Slowest prompt processing a wait for the next token allows for.
+    /// LFM2.5 2.6B processed a 9K-token prompt at about 160 tokens/s on an
+    /// iPhone 16 Pro; larger models and older phones are slower.
+    nonisolated static let slowestPrefillTokensPerSecond = 40.0
+
+    /// Extra time for prompt processing, which emits nothing until it ends, so
+    /// a long prompt no longer trips the fixed first-token timeout.
+    nonisolated static func prefillAllowance(forPromptTokens tokens: Int) -> Duration {
+        .seconds(Double(max(tokens, 0)) / slowestPrefillTokensPerSecond)
+    }
 
     // MARK: - Coalesced saving with optimized debouncing
     var pendingSaveTask: Task<Void, Never>?
@@ -1221,6 +1231,17 @@ final class ChatViewModel: ObservableObject {
         var result = StreamConsumptionResult()
         var lastModelWrite: Date = .distantPast
         let activeChunkTimeout = target.isReasoningMode ? reasoningChunkTimeout : chunkTimeout
+        let prefillAllowance: Duration = switch preparation.backendRequest {
+        case .mlx(_, _, let messages, _, _, _, _):
+            Self.prefillAllowance(forPromptTokens: messages.reduce(0) {
+                $0 + Self.heuristicPromptTokenCount(for: $1.content)
+            })
+        case .foundation:
+            .zero
+        }
+        // The prompt is processed before the first token and again after each
+        // tool result, so those waits get the prefill allowance.
+        var awaitingPrefill = true
         let generationStartedAt = Date()
         let backendLabel: String
         let modelName: String?
@@ -1276,7 +1297,8 @@ final class ChatViewModel: ObservableObject {
                 let eventTimeout: Duration = if preparation.webSearchBridge?.hasSearchInProgress == true {
                     webSearchTimeout
                 } else {
-                    result.wroteAny ? activeChunkTimeout : firstTokenTimeout
+                    (result.wroteAny ? activeChunkTimeout : firstTokenTimeout)
+                        + (awaitingPrefill ? prefillAllowance : .zero)
                 }
                 do {
                     nextEvent = try await withTimeout(eventTimeout) {
@@ -1311,6 +1333,7 @@ final class ChatViewModel: ObservableObject {
                 switch nextEvent {
                 case .text(let newText):
                     guard !newText.isEmpty else { continue }
+                    awaitingPrefill = false
                     let isFirstOutput = !result.wroteAny
                     if !appendStreamingChunk(newText, into: &result) {
                         continue
@@ -1318,6 +1341,7 @@ final class ChatViewModel: ObservableObject {
                     if isFirstOutput { updateStreamingActivity() }
                     renderIfThrottled()
                 case .toolCall:
+                    awaitingPrefill = true
                     if let liveTarget = conversation.messages.first(where: { $0.id == preparation.targetID }),
                        liveTarget.isReasoningMode {
                         liveTarget.reopenReasoningForToolCall(

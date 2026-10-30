@@ -193,4 +193,15 @@ extension ChatLLMTests {
         #expect(!viewModel.isGenerating)
         #expect(!viewModel.isGenerationActive(id))
     }
+
+    @Test func longPromptsGetTimeForPromptProcessingBeforeTheFirstToken() {
+        // A 31,674-character paste needed 57 s of prompt processing on an
+        // iPhone 16 Pro and failed the fixed 30 s first-token timeout.
+        let pasteTokens = ChatViewModel.heuristicPromptTokenCount(for: String(repeating: "a", count: 31_674))
+        #expect(ChatViewModel.prefillAllowance(forPromptTokens: pasteTokens) + .seconds(30) > .seconds(57 * 2))
+
+        #expect(ChatViewModel.prefillAllowance(forPromptTokens: 0) == .zero)
+        #expect(ChatViewModel.prefillAllowance(forPromptTokens: -5) == .zero)
+        #expect(ChatViewModel.prefillAllowance(forPromptTokens: 400) == .seconds(10))
+    }
 }

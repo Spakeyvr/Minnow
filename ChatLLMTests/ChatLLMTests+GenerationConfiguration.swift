@@ -155,6 +155,25 @@ extension ChatLLMTests {
         #expect(configuration.cacheCompression == .none)
     }
 
+    @Test func raisedContextWindowLimitGrowsTheLowMemorySlidingWindow() {
+        let configuration = { (contextWindowLimitRaised: Bool) in
+            MLXModelManager.generationConfiguration(
+                isEnabled: true,
+                preferRotorQuant: true,
+                hasTools: false,
+                hasMedia: false,
+                memoryConstrained: false,
+                prefersBoundedCache: true,
+                configuredMaxOutputTokens: nil,
+                configuredContextWindow: 8192,
+                contextWindowLimitRaised: contextWindowLimitRaised
+            )
+        }
+
+        #expect(configuration(false).cachePolicy == .boundedRotating(maxKVSize: 4096))
+        #expect(configuration(true).cachePolicy == .boundedRotating(maxKVSize: 8192))
+    }
+
     @Test func promptTokenCostFallsBackToHeuristicWhenTokenizerCountUnavailable() {
         let cost = ChatViewModel.promptTokenCost(
             tokenizedContentTokenCount: nil,

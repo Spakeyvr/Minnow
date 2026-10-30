@@ -1260,6 +1260,14 @@ final class ChatLLMUITests: XCTestCase {
         toggle(memory)
         app.alerts.buttons["Disable"].tap()
         XCTAssertEqual(memory.value as? String, "1")
+        let fullCache = app.switches["settings.forcePersistentKVCache"]
+        XCTAssertEqual(fullCache.value as? String, "0")
+        toggle(fullCache)
+        XCTAssertEqual(fullCache.value as? String, "1")
+        let contextLimit = app.switches["settings.overrideContextWindowLimit"]
+        XCTAssertEqual(contextLimit.value as? String, "0")
+        toggle(contextLimit)
+        XCTAssertEqual(contextLimit.value as? String, "1")
         settingsBackButton(in: app).tap()
         app.buttons["settings.reset"].tap()
         app.alerts.buttons["Cancel"].tap()
@@ -1270,6 +1278,8 @@ final class ChatLLMUITests: XCTestCase {
         app.alerts.buttons["Reset"].tap()
         app.buttons["settings.developer"].tap()
         XCTAssertEqual(memory.value as? String, "0")
+        XCTAssertEqual(fullCache.value as? String, "0")
+        XCTAssertEqual(contextLimit.value as? String, "0")
     }
 
     @MainActor

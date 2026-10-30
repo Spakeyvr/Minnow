@@ -160,6 +160,35 @@ extension ChatLLMTests {
         #expect(profile.hasLowMemoryForPersistentKVCache)
     }
 
+    @Test func keepFullKVCacheSettingLetsLowMemoryPhonesUseRotorQuant() {
+        let eightGigabyteManager = makeModelManager(deviceSupportProfile: makeDeviceProfile(
+            isPhone: true,
+            physicalMemoryBytes: 8 * MLXDeviceSupportProfile.gibibyte
+        ))
+        let twelveGigabyteManager = makeModelManager(deviceSupportProfile: makeDeviceProfile(
+            isPhone: true,
+            physicalMemoryBytes: 12 * MLXDeviceSupportProfile.gibibyte
+        ))
+        let rotorQuantPolicy = { (prefersBoundedCache: Bool) in
+            MLXModelManager.cachePolicy(
+                isEnabled: true,
+                hasTools: false,
+                prefersBoundedCache: prefersBoundedCache,
+                memoryConstrained: false
+            )
+        }
+
+        #expect(eightGigabyteManager.prefersBoundedKVCacheAcrossTurns)
+        #expect(rotorQuantPolicy(eightGigabyteManager.prefersBoundedKVCacheAcrossTurns) == .boundedRotating(maxKVSize: 4096))
+        #expect(!twelveGigabyteManager.prefersBoundedKVCacheAcrossTurns)
+
+        testEnvironment.defaults.set(true, forKey: AppSettingsKeys.forcePersistentKVCache)
+
+        #expect(!eightGigabyteManager.prefersBoundedKVCacheAcrossTurns)
+        #expect(rotorQuantPolicy(eightGigabyteManager.prefersBoundedKVCacheAcrossTurns) == .persistentRotorQuant)
+        #expect(!twelveGigabyteManager.prefersBoundedKVCacheAcrossTurns)
+    }
+
     @Test func contextWindowMaximumTracksSixEightAndTwelveGigabyteTiers() {
         let sixGigabyteProfile = makeDeviceProfile(
             isPhone: true,

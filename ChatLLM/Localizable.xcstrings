@@ -2543,24 +2543,24 @@
         }
       }
     },
-    "Enabled by default for persistent MLX text and image chats, RotorQuant uses IsoQuant block rotations with 3-bit keys, 2-bit values, exact prefill buffering, and per-layer deterministic rotation parameters to reduce memory use. Tool and low-memory turns use safer uncompressed or bounded caches." : {
+    "Enabled by default for persistent MLX text and image chats, RotorQuant uses IsoQuant block rotations with 4-bit keys, 4-bit values, exact prefill buffering, and per-layer deterministic rotation parameters to reduce memory use. Tool and low-memory turns use safer uncompressed or bounded caches." : {
       "localizations" : {
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "RotorQuant ist standardmäßig für persistente MLX-Text- und Bildchats aktiviert. Es nutzt IsoQuant-Blockrotationen mit 3-Bit-Schlüsseln, 2-Bit-Werten, exakter Prefill-Pufferung und deterministischen Rotationsparametern pro Schicht, um den Speicherbedarf zu verringern. Bei Tool-Aufrufen und wenig Arbeitsspeicher werden sicherere unkomprimierte oder begrenzte Caches verwendet."
+            "value" : "RotorQuant ist standardmäßig für persistente MLX-Text- und Bildchats aktiviert. Es nutzt IsoQuant-Blockrotationen mit 4-Bit-Schlüsseln, 4-Bit-Werten, exakter Prefill-Pufferung und deterministischen Rotationsparametern pro Schicht, um den Speicherbedarf zu verringern. Bei Tool-Aufrufen und wenig Arbeitsspeicher werden sicherere unkomprimierte oder begrenzte Caches verwendet."
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Enabled by default for persistent MLX text and image chats, RotorQuant uses IsoQuant block rotations with 3-bit keys, 2-bit values, exact prefill buffering, and per-layer deterministic rotation parameters to reduce memory use. Tool and low-memory turns use safer uncompressed or bounded caches."
+            "value" : "Enabled by default for persistent MLX text and image chats, RotorQuant uses IsoQuant block rotations with 4-bit keys, 4-bit values, exact prefill buffering, and per-layer deterministic rotation parameters to reduce memory use. Tool and low-memory turns use safer uncompressed or bounded caches."
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "RotorQuant está activado por defecto en los chats persistentes de texto e imagen de MLX. Usa rotaciones de bloques IsoQuant con claves de 3 bits, valores de 2 bits, almacenamiento exacto del prefill y parámetros de rotación deterministas por capa para reducir el uso de memoria. Los turnos con herramientas o poca memoria usan cachés más seguras, sin comprimir o con límites."
+            "value" : "RotorQuant está activado por defecto en los chats persistentes de texto e imagen de MLX. Usa rotaciones de bloques IsoQuant con claves de 4 bits, valores de 4 bits, almacenamiento exacto del prefill y parámetros de rotación deterministas por capa para reducir el uso de memoria. Los turnos con herramientas o poca memoria usan cachés más seguras, sin comprimir o con límites."
           }
         }
       }
@@ -3643,6 +3643,28 @@
         }
       }
     },
+    "Keep Full KV Cache" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vollständigen KV-Cache behalten"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep Full KV Cache"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantener la caché KV completa"
+          }
+        }
+      }
+    },
     "Key is valid" : {
       "localizations" : {
         "de" : {
@@ -3771,6 +3793,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Última actualización: %@"
+          }
+        }
+      }
+    },
+    "Let the On-Device Models context window go up to 32,768 tokens, past this device’s limit. Large contexts can run out of memory and crash the app." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erlaubt unter „Modelle auf dem Gerät“ ein Kontextfenster von bis zu 32.768 Tokens, über das Limit dieses Geräts hinaus. Große Kontexte können den Speicher erschöpfen und die App abstürzen lassen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Let the On-Device Models context window go up to 32,768 tokens, past this device’s limit. Large contexts can run out of memory and crash the app."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Permite que la ventana de contexto de Modelos en el dispositivo llegue a 32.768 tokens, por encima del límite de este dispositivo. Los contextos grandes pueden agotar la memoria y cerrar la app."
           }
         }
       }
@@ -4589,6 +4633,28 @@
         }
       }
     },
+    "On devices with less than 12 GB of RAM, keep the whole conversation in the model cache instead of a sliding window. RotorQuant applies when it’s on. Long chats can run out of memory." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf Geräten mit weniger als 12 GB RAM bleibt die gesamte Unterhaltung im Modell-Cache statt in einem gleitenden Fenster. RotorQuant wird verwendet, wenn es aktiviert ist. Lange Chats können den Speicher erschöpfen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "On devices with less than 12 GB of RAM, keep the whole conversation in the model cache instead of a sliding window. RotorQuant applies when it’s on. Long chats can run out of memory."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "En dispositivos con menos de 12 GB de RAM, mantiene toda la conversación en la caché del modelo en lugar de una ventana deslizante. RotorQuant se aplica si está activado. Los chats largos pueden agotar la memoria."
+          }
+        }
+      }
+    },
     "On-Device Models" : {
       "localizations" : {
         "de" : {
@@ -5069,6 +5135,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Modelo multimodal Qwen 3.5 4B con razonamiento y visión nativos."
+          }
+        }
+      }
+    },
+    "Raise Context Window Limit" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kontextfenster-Limit erhöhen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Raise Context Window Limit"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aumentar el límite de la ventana de contexto"
           }
         }
       }

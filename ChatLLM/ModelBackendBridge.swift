@@ -394,6 +394,18 @@ extension UserDefaults {
         return storedValue == 0 ? nil : storedValue
     }
 
+    /// Ceiling for the context window slider when the Developer override
+    /// lifts the device limit.
+    static let mlxDeveloperContextWindowMaximum = 32_768
+
+    /// The context window slider's ceiling: the device limit, or the
+    /// developer maximum while the override is on.
+    func mlxContextWindowMaximum(deviceMaximum: Int) -> Int {
+        bool(forKey: AppSettingsKeys.overrideContextWindowLimit)
+            ? max(deviceMaximum, Self.mlxDeveloperContextWindowMaximum)
+            : deviceMaximum
+    }
+
     func mlxContextWindowTokens(deviceMaximum: Int) -> Int {
         let minimum = 512
 
@@ -406,7 +418,8 @@ extension UserDefaults {
             return deviceMaximum
         }
 
-        return min(max(storedValue, minimum), deviceMaximum)
+        // Only a chosen value goes past the device limit; the default stays on it.
+        return min(max(storedValue, minimum), mlxContextWindowMaximum(deviceMaximum: deviceMaximum))
     }
 
     var mlxEnableRotorQuant: Bool {

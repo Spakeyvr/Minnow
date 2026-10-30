@@ -2,7 +2,7 @@ import SwiftUI
 
 struct SettingsSheet: View {
     @Environment(\.locale) private var locale
-    static var mlxRotorQuantInfoMessage: String { String(localized: "Enabled by default for persistent MLX text and image chats, RotorQuant uses IsoQuant block rotations with 3-bit keys, 2-bit values, exact prefill buffering, and per-layer deterministic rotation parameters to reduce memory use. Tool and low-memory turns use safer uncompressed or bounded caches.", bundle: .appLocalized) }
+    static var mlxRotorQuantInfoMessage: String { String(localized: "Enabled by default for persistent MLX text and image chats, RotorQuant uses IsoQuant block rotations with 4-bit keys, 4-bit values, exact prefill buffering, and per-layer deterministic rotation parameters to reduce memory use. Tool and low-memory turns use safer uncompressed or bounded caches.", bundle: .appLocalized) }
     static var mlxRotorQuantAccessibilityHint: String { String(localized: "Enabled by default for supported persistent MLX text and image chats. Tool and low-memory turns use safer cache modes.", bundle: .appLocalized) }
     static var mlxRotorQuantExperimentalTitle: String { String(localized: "RotorQuant Experimental", bundle: .appLocalized) }
     static var mlxRotorQuantExperimentalMessage: String { String(localized: "RotorQuant is very early and in beta. It can reduce KV-cache memory, but speed and stability are still being tuned.", bundle: .appLocalized) }

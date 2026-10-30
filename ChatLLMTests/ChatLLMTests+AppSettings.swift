@@ -19,8 +19,8 @@ extension ChatLLMTests {
     @Test func settingsSheetDescribesAdaptiveKVCacheBehavior() {
         #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("Enabled by default"))
         #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("IsoQuant"))
-        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("3-bit keys"))
-        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("2-bit values"))
+        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("4-bit keys"))
+        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("4-bit values"))
         #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("text and image"))
         #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("Tool and low-memory"))
         #expect(SettingsSheet.mlxRotorQuantAccessibilityHint.contains("safer cache modes"))
@@ -47,8 +47,8 @@ extension ChatLLMTests {
         }
 
         #expect(rotorConfiguration.variant == .iso)
-        #expect(rotorConfiguration.keyBits == 3)
-        #expect(rotorConfiguration.valueBits == 2)
+        #expect(rotorConfiguration.keyBits == 4)
+        #expect(rotorConfiguration.valueBits == 4)
         #expect(rotorConfiguration.exactBufferSize == 128)
         #expect(rotorConfiguration.attentionBlockTokens == 128)
         #expect(rotorConfiguration.prefillExactLimit == 4096)
@@ -73,8 +73,8 @@ extension ChatLLMTests {
         }
 
         #expect(rotorConfiguration.variant == .iso)
-        #expect(rotorConfiguration.keyBits == 3)
-        #expect(rotorConfiguration.valueBits == 2)
+        #expect(rotorConfiguration.keyBits == 4)
+        #expect(rotorConfiguration.valueBits == 4)
         #expect(rotorConfiguration.exactBufferSize == 32)
         #expect(rotorConfiguration.attentionBlockTokens == 64)
         #expect(rotorConfiguration.prefillExactLimit == 4096)
@@ -331,6 +331,8 @@ extension ChatLLMTests {
         draft.autoDeleteDays = 7
         draft.developerModeEnabled = true
         draft.disableRAMPrecautions = true
+        draft.forcePersistentKVCache = true
+        draft.overrideContextWindowLimit = true
         draft.disableToolCalls = true
 
         draft.persist(to: defaults, comparedTo: baseline)
@@ -374,6 +376,23 @@ extension ChatLLMTests {
         #expect(defaults.mlxContextWindowTokens(deviceMaximum: 8_192) == 8_192)
         defaults.set(4_096, forKey: AppSettingsKeys.mlxContextWindowTokens)
         #expect(defaults.mlxContextWindowTokens(deviceMaximum: 8_192) == 4_096)
+    }
+
+    @Test func contextWindowOverrideLetsAChosenValuePassTheDeviceLimit() throws {
+        let defaults = try makeScratchDefaults(#function)
+        defaults.set(true, forKey: AppSettingsKeys.overrideContextWindowLimit)
+
+        // The default still follows the device; only a chosen value goes past it.
+        #expect(defaults.mlxContextWindowMaximum(deviceMaximum: 2_048) == 32_768)
+        #expect(defaults.mlxContextWindowTokens(deviceMaximum: 2_048) == 2_048)
+        defaults.set(8_192, forKey: AppSettingsKeys.mlxContextWindowTokens)
+        #expect(defaults.mlxContextWindowTokens(deviceMaximum: 2_048) == 8_192)
+        defaults.set(99_999, forKey: AppSettingsKeys.mlxContextWindowTokens)
+        #expect(defaults.mlxContextWindowTokens(deviceMaximum: 2_048) == 32_768)
+
+        defaults.set(false, forKey: AppSettingsKeys.overrideContextWindowLimit)
+        #expect(defaults.mlxContextWindowMaximum(deviceMaximum: 2_048) == 2_048)
+        #expect(defaults.mlxContextWindowTokens(deviceMaximum: 2_048) == 2_048)
     }
 
     @Test func settingsDoNotRoundTripAnOutOfRangeOutputTokenBudget() throws {

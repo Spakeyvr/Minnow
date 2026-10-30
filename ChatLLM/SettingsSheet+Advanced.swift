@@ -45,10 +45,15 @@ private struct MLXSettingsView: View {
     @Environment(\.locale) private var locale
 
     private var deviceMaximum: Int { MLXDeviceSupportProfile.current.maxContextWindowTokens }
+    private var sliderMaximum: Int {
+        settings.overrideContextWindowLimit
+            ? max(deviceMaximum, UserDefaults.mlxDeveloperContextWindowMaximum)
+            : deviceMaximum
+    }
     private var contextTokens: Binding<Double> {
         Binding(
             get: { Double(settings.mlxContextWindowTokens <= 0
-                          ? deviceMaximum : min(max(settings.mlxContextWindowTokens, 512), deviceMaximum)) },
+                          ? deviceMaximum : min(max(settings.mlxContextWindowTokens, 512), sliderMaximum)) },
             set: { settings.mlxContextWindowTokens = Int($0.rounded()) }
         )
     }
@@ -61,7 +66,7 @@ private struct MLXSettingsView: View {
         Form {
             Section {
                 LabeledContent("Context Window", value: String(localized: "\(Int(contextTokens.wrappedValue)) tokens", bundle: .appLocalized, locale: locale))
-                Slider(value: contextTokens, in: 512...Double(deviceMaximum), step: 512) {
+                Slider(value: contextTokens, in: 512...Double(sliderMaximum), step: 512) {
                     Text("Context Window")
                 }
                 .accessibilityValue("\(Int(contextTokens.wrappedValue)) tokens")
@@ -154,6 +159,18 @@ private struct DeveloperSettingsView: View {
                 .accessibilityIdentifier("settings.disableRAMPrecautions")
             } footer: {
                 Text("Allow models and tool calls that exceed this device’s memory limits. This can cause crashes or severe slowdowns.")
+            }
+            Section {
+                Toggle("Raise Context Window Limit", isOn: $settings.overrideContextWindowLimit)
+                    .accessibilityIdentifier("settings.overrideContextWindowLimit")
+            } footer: {
+                Text("Let the On-Device Models context window go up to 32,768 tokens, past this device’s limit. Large contexts can run out of memory and crash the app.")
+            }
+            Section {
+                Toggle("Keep Full KV Cache", isOn: $settings.forcePersistentKVCache)
+                    .accessibilityIdentifier("settings.forcePersistentKVCache")
+            } footer: {
+                Text("On devices with less than 12 GB of RAM, keep the whole conversation in the model cache instead of a sliding window. RotorQuant applies when it’s on. Long chats can run out of memory.")
             }
         }
         .navigationTitle("Developer")

@@ -11,48 +11,43 @@ import FoundationModels
 import UIKit
 import OSLog
 
-nonisolated private let contentLogger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ChatLLM", category: "ContentView")
+nonisolated let contentLogger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ChatLLM", category: "ContentView")
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
+    @Environment(\.modelContext) var modelContext
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @Query(sort: \Conversation.lastUpdated, order: .reverse)
-    private var conversations: [Conversation]
+    var conversations: [Conversation]
 
-    @State private var selection: Conversation?
-    @State private var currentViewModel: ChatViewModel?
-    @State private var draftConversation: Conversation? = nil
-    @State private var preferredCompactColumn = NavigationSplitViewColumn.sidebar
+    @State var selection: Conversation?
+    @State var currentViewModel: ChatViewModel?
+    @State var draftConversation: Conversation? = nil
     @State private var isSidebarOpen = false
 
     @State private var searchText: String = ""
     @State private var debouncedSearchText: String = ""
     @State private var searchDebounceTask: Task<Void, Never>?
+    @State private var sidebarSectionsCache = SidebarSectionsCache()
     @State private var showSettings: Bool = false
     @State private var pendingSettingsAction: SettingsDataAction?
-    @State private var isLoading: Bool = false
-    @State private var errorMessage: String?
+    @State var errorMessage: String?
     @State private var isErrorAlertPresented: Bool = false
-    private struct ChatExport: Identifiable {
-        let url: URL
-        var id: URL { url }
-    }
 
-    @State private var chatExport: ChatExport?
-    @State private var exportURL: URL?
+    @State var chatExport: ChatExport?
+    @State var exportURL: URL?
     @State private var isSearchPresented: Bool = false
-    @State private var attachmentCleanupTask: Task<Void, Never>?
-    @State private var isPerformingAutoDelete = false
+    @State var attachmentCleanupTask: Task<Void, Never>?
+    @State var isPerformingAutoDelete = false
     @Environment(\.scenePhase) private var scenePhase
 
     // App-wide preferences
     @AppStorage(AppSettingsKeys.chatPreferences) private var chatPreferences: String = ""
     @AppStorage(AppSettingsKeys.appAppearance) private var appAppearance: String = "system" // system | light | dark
-    @AppStorage(AppSettingsKeys.appLanguage) private var appLanguage: String = "en" // en | de | es
+    @AppStorage(AppSettingsKeys.appLanguage) private var appLanguage: String = AppLanguage.systemDefault.rawValue // en | de | es
     @AppStorage(AppSettingsKeys.reasoningModeDefault) private var reasoningModeDefault: Bool = false
-    @AppStorage(AppSettingsKeys.autoDeleteOldChats) private var autoDeleteOldChats: Bool = false
-    @AppStorage(AppSettingsKeys.autoDeleteDays) private var autoDeleteDays: Int = 30
+    @AppStorage(AppSettingsKeys.autoDeleteOldChats) var autoDeleteOldChats: Bool = false
+    @AppStorage(AppSettingsKeys.autoDeleteDays) var autoDeleteDays: Int = 30
     @AppStorage(AppSettingsKeys.hasCompletedOnboarding) private var hasCompletedOnboarding: Bool = false
 
     private var storedChatPreferences: String {
@@ -115,15 +110,6 @@ struct ContentView: View {
                 // The app can stay suspended for days, so retention can't wait for a cold launch.
                 if phase == .active { performAutoDeleteIfNeeded() }
             }
-            .onChange(of: preferredCompactColumn) { _, newColumn in
-                // When user presses Back on iPhone from a draft chat, discard the stale draft so
-                // the next "New Chat" tap is not blocked by the guard in startDraftChat().
-                if newColumn == .sidebar, draftConversation != nil, selection == nil {
-                    draftConversation = nil
-                    currentViewModel?.deactivate()
-                    currentViewModel = nil
-                }
-            }
             .errorAlert(
                 isPresented: $isErrorAlertPresented,
                 message: errorMessage ?? String(localized: "An unknown error occurred.", bundle: .appLocalized),
@@ -135,7 +121,11 @@ struct ContentView: View {
             .settingsCover(
                 isPresented: $showSettings,
                 hasChats: !conversations.isEmpty,
-                canDeleteAllExceptCurrent: conversations.count > 1,
+                canDeleteAllExceptCurrent: ChatNavigationRules.canDeleteAllExceptCurrent(
+                    conversationIDs: conversations.map(\.id),
+                    selectionID: selection?.id,
+                    draftID: draftConversation?.id
+                ),
                 onDeleteAll: { queueSettingsAction(.deleteAll) },
                 onDeleteAllExceptCurrent: { queueSettingsAction(.deleteAllExceptCurrent) },
                 onExportChats: { queueSettingsAction(.export) },
@@ -187,23 +177,24 @@ struct ContentView: View {
         }
     }
 
-    // Split the NavigationSplitView out of body to reduce complexity
+    // Regular width only: compact width uses the drawer, so this split view never collapses.
     private var splitView: some View {
-        NavigationSplitView(preferredCompactColumn: $preferredCompactColumn) {
+        NavigationSplitView {
             sidebar
         } detail: {
             detailContent
         }
     }
-    
+
     // MARK: - Lifecycle handlers (split out for type-checking simplicity)
-    
+
     private func handleOnAppear() {
+        #if DEBUG
         if let demoConversation = seedWebSearchDemoIfNeeded() {
             selection = demoConversation
-            preferredCompactColumn = .detail
             return
         }
+        #endif
 
         // Clean up old chats if auto-delete is enabled
         performAutoDeleteIfNeeded()
@@ -223,178 +214,6 @@ struct ContentView: View {
         }
     }
 
-    private func seedWebSearchDemoIfNeeded() -> Conversation? {
-        let arguments = ProcessInfo.processInfo.arguments
-        guard arguments.contains("-ui-test-web-search-demo") else { return nil }
-        if let existing = conversations.first(where: { $0.title == "Web Search Preview" }) {
-            return existing
-        }
-
-        let includesReasoning = !arguments.contains("-ui-test-web-search-without-reasoning")
-        let usesLongReasoning = arguments.contains("-ui-test-long-reasoning-demo")
-        let demoReasoning = usesLongReasoning
-            ? """
-            I need current platform information, so I should check primary sources.
-            The first search gives the broad release context. A second, narrower query can confirm the exact SwiftUI API.
-            I should compare the terminology used by both sources before drawing a conclusion.
-            This newly exposed reasoning must appear immediately when the sheet expands.
-            I should also verify that the terminology is consistent across the documentation.
-            That comparison rules out a naming mismatch between the two sources.
-            The implementation details now line up with the platform overview.
-            No additional search is needed before forming the final response.
-            Finally, I can summarize the verified platform change concisely.
-            """
-            : "I need current platform information, so I should check primary sources.\n\n</think>\n\nThe first search gives the broad release context. A second, narrower query can confirm the exact SwiftUI API.\n\n</think>"
-
-        let conversation = Conversation(title: "Web Search Preview", reasoningMode: true)
-        // Earlier exchanges that make the conversation taller than the screen.
-        let fillerMessages: [Message] = arguments.contains("-ui-test-long-chat")
-            ? (0..<24).map { index in
-                Message(
-                    role: index.isMultiple(of: 2) ? .user : .assistant,
-                    text: "Earlier message \(index + 1)",
-                    order: index,
-                    conversation: conversation,
-                    isFinal: true
-                )
-            }
-            : []
-        let userMessage = Message(
-            role: .user,
-            text: "What changed in SwiftUI web views this year?",
-            order: fillerMessages.count,
-            conversation: conversation,
-            isFinal: true
-        )
-        let assistantMessage = Message(
-            role: .assistant,
-            text: "",
-            order: fillerMessages.count + 1,
-            conversation: conversation,
-            isFinal: true,
-            reasoning: includesReasoning
-                ? demoReasoning
-                : " \n ",
-            finalAnswer: "SwiftUI now has a native `WebView` and an observable `WebPage` model.\n\n**The key change is native SwiftUI integration.**\n\nApps can embed and control web content without wrapping `WKWebView` themselves, while Apple’s documentation and release coverage agree on the core API shape.",
-            isReasoningMode: true,
-            generationBackend: "Preview",
-            generationModelName: "UI Fixture"
-        )
-
-        let firstResponse = WebSearchResponse(
-            query: "SwiftUI WebView iOS 26 changes",
-            sources: [
-                WebSearchSource(
-                    title: "WebKit for SwiftUI",
-                    url: "https://developer.apple.com/documentation/webkit/webkit-for-swiftui",
-                    snippet: "Apple documents the SwiftUI-native WebView and WebPage APIs for displaying and controlling web content.",
-                    score: 0.97,
-                    publishedDate: "June 2026"
-                ),
-                WebSearchSource(
-                    title: "What’s new in WebKit and Safari",
-                    url: "https://webkit.org/blog/",
-                    snippet: "WebKit release notes cover new platform capabilities and behavior across Safari and embedded web views.",
-                    score: 0.89
-                ),
-                WebSearchSource(
-                    title: "SwiftUI updates",
-                    url: "https://developer.apple.com/swiftui/whats-new/",
-                    snippet: "Apple’s SwiftUI overview highlights the newest framework APIs and platform integrations.",
-                    score: 0.84
-                )
-            ],
-            responseTimeSeconds: 0.42
-        )
-        let secondResponse = WebSearchResponse(
-            query: "Apple WebPage WebView SwiftUI documentation",
-            sources: [
-                WebSearchSource(
-                    title: "WebView",
-                    url: "https://developer.apple.com/documentation/webkit/webview-swift.struct",
-                    snippet: "A SwiftUI view that displays web content managed by a WebPage instance.",
-                    score: 0.99
-                ),
-                WebSearchSource(
-                    title: "WebPage",
-                    url: "https://developer.apple.com/documentation/webkit/webpage",
-                    snippet: "An observable object that manages navigation, page state, and interactions for web content.",
-                    score: 0.98
-                )
-            ],
-            responseTimeSeconds: 0.31
-        )
-        let now = Date()
-        if includesReasoning {
-            assistantMessage.reasoningStartedAt = now.addingTimeInterval(-68)
-            assistantMessage.reasoningCompletedAt = now
-        }
-        assistantMessage.searchInvocations = [
-            SearchInvocation(
-                query: firstResponse.query,
-                results: firstResponse.modelFacingText(),
-                response: firstResponse,
-                status: .completed,
-                anchorStepNumber: 1,
-                timestamp: now.addingTimeInterval(-1.1),
-                completedAt: now.addingTimeInterval(-0.68)
-            ),
-            SearchInvocation(
-                query: secondResponse.query,
-                results: secondResponse.modelFacingText(),
-                response: secondResponse,
-                status: .completed,
-                anchorStepNumber: 2,
-                timestamp: now.addingTimeInterval(-0.55),
-                completedAt: now.addingTimeInterval(-0.24)
-            )
-        ]
-        conversation.messages = fillerMessages + [userMessage, assistantMessage]
-        modelContext.insert(conversation)
-        if arguments.contains("-ui-test-image-message") {
-            attachFixtureImage(to: userMessage)
-        }
-        if arguments.contains("-ui-test-second-chat") {
-            seedSecondChatFixture()
-        }
-        try? modelContext.save()
-        return conversation
-    }
-
-    private func attachFixtureImage(to message: Message) {
-        let image = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 240)).image { context in
-            UIColor.systemTeal.setFill()
-            context.fill(CGRect(x: 0, y: 0, width: 320, height: 240))
-        }
-        Task { @MainActor in
-            guard let url = try? await ImageStore.shared.save(image: image) else { return }
-            let attachment = MessageAttachment(type: .image, fileURL: url, fileName: url.lastPathComponent)
-            message.attachments.append(attachment)
-            attachment.message = message
-            try? modelContext.save()
-        }
-    }
-
-    private func seedSecondChatFixture() {
-        let conversation = Conversation(title: "Second Chat")
-        conversation.messages = [
-            Message(role: .user, text: "Hello there", order: 0, conversation: conversation, isFinal: true),
-            Message(
-                role: .assistant,
-                text: "Second chat reply.",
-                order: 1,
-                conversation: conversation,
-                isFinal: true,
-                generationBackend: "Preview",
-                generationModelName: "UI Fixture"
-            )
-        ]
-        if ProcessInfo.processInfo.arguments.contains("-ui-test-stale-second-chat") {
-            conversation.lastUpdated = Calendar.current.date(byAdding: .day, value: -60, to: Date()) ?? Date()
-        }
-        modelContext.insert(conversation)
-    }
-    
     private func handleSelectionChange(_ oldSelection: Conversation?, _ newSelection: Conversation?) {
         let newID = newSelection?.id
         // Entering draft mode: selection becomes nil but we want to keep the draft vm alive.
@@ -409,45 +228,38 @@ struct ContentView: View {
             currentViewModel = nil
         }
         ModelBackendBridge.shared.bindConversation(newSelection)
-        // Build the chat as soon as it is selected. On iPhone the collapsed split view
-        // pushes the detail page right away; if ChatView only replaces the placeholder
-        // afterwards, a re-pushed page never refreshes and stays on "Preparing chat…".
+        // Build the chat as soon as it is selected, so the detail column never waits
+        // on the "Preparing chat…" placeholder.
         if let newSelection {
-            currentViewModel = createViewModel(for: newSelection)
+            openViewModel(for: newSelection)
         }
     }
-    
+
     private func handleConversationsChange(_ oldConversations: [Conversation], _ newConversations: [Conversation]) {
-        // When a draft conversation's first message is saved it gets inserted into the context,
-        // which triggers this handler. Detect that moment and promote the draft to a real selection.
-        if let draft = draftConversation,
-           newConversations.contains(where: { $0.id == draft.id }),
-           !oldConversations.contains(where: { $0.id == draft.id }) {
+        let change = ChatNavigationRules.listChange(
+            from: oldConversations.map(\.id),
+            to: newConversations.map(\.id),
+            selectionID: selection?.id,
+            draftID: draftConversation?.id,
+            isRegularWidth: horizontalSizeClass == .regular
+        )
+        switch change {
+        case .promoteDraft:
+            // The draft's first message was saved, inserting it into the context.
+            guard let draft = draftConversation else { return }
             draftConversation = nil
             selection = draft
-            return
-        }
-
-        // Ensure selection is still valid after conversations change
-        if let currentSelection = selection {
-            // Check if current selection still exists by ID (safer than object comparison)
-            let selectionExists = newConversations.contains(where: { $0.id == currentSelection.id })
-            
-            if !selectionExists {
-                // Current selection was deleted - clean up view model if it hasn't been already
-                if let currentVM = currentViewModel, currentVM.conversation.id == currentSelection.id {
-                    currentVM.deactivate()
-                    currentViewModel = nil
-                }
-                
-                openDraftChat()
+        case .replaceDeletedSelection:
+            // The open chat was deleted; retire its view model if that hasn't happened yet.
+            if let currentVM = currentViewModel, currentVM.conversation.id == selection?.id {
+                currentVM.deactivate()
+                currentViewModel = nil
             }
-        } else if selection == nil,
-                  draftConversation == nil,
-                  horizontalSizeClass == .regular,
-                  let first = newConversations.first {
-            // Only auto-select the first conversation on regular width.
-            selection = first
+            openDraftChat()
+        case .select(let id):
+            selection = newConversations.first { $0.id == id }
+        case .none:
+            break
         }
     }
     
@@ -469,63 +281,26 @@ struct ContentView: View {
         return nil
     }
 
-    private func attachmentURLs(in conversations: [Conversation]) -> [URL] {
-        conversations
-            .flatMap(\.messages)
-            .flatMap(\.attachments)
-            .map(\.actualFileURL)
-    }
-
-    private func deleteAttachmentFiles(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
-        Task {
-            for url in urls {
-                try? await ImageStore.shared.delete(url: url)
-                await ImageStore.shared.deleteInferenceVariant(for: url)
-            }
-        }
-    }
-
-    private func scheduleAttachmentStorageCleanup(excludingConversationIDs excludedConversationIDs: Set<UUID> = []) {
-        attachmentCleanupTask?.cancel()
-        attachmentCleanupTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(2))
-            guard !Task.isCancelled else { return }
-
-            // A failed fetch must skip cleanup: an empty set would delete every image.
-            guard let referencedURLs = try? MessageAttachment.referencedFileURLs(
-                in: modelContext,
-                excludingConversationIDs: excludedConversationIDs
-            ) else { return }
-            try? await ImageStore.shared.cleanupOrphanedFiles(referencedURLs: referencedURLs)
-        }
-    }
-    
     // Extracted to reduce complexity in body
     @ViewBuilder
     private var detailContent: some View {
         if let vm = activeChatViewModel {
             ChatView(viewModel: vm, onNewChat: { startDraftChat() })
+                // One chat screen per conversation: composer text, an attached image or an
+                // in-progress edit must never carry over into another chat.
+                .id(vm.conversation.id)
         } else if let convo = selection {
-            if let vm = currentViewModel, vm.conversation.id == convo.id {
-                ChatView(viewModel: vm, onNewChat: { startDraftChat() })
-            } else {
-                VStack(spacing: 16) {
-                    ProgressView()
-                    Text("Preparing chat…")
-                        .foregroundStyle(.secondary)
-                }
-                .task(id: convo.id) {
-                    await MainActor.run {
-                        guard !Task.isCancelled, selection?.id == convo.id else { return }
-                        if currentViewModel?.conversation.id != convo.id {
-                            currentViewModel?.deactivate()
-                        }
-                        currentViewModel = createViewModel(for: convo)
-                    }
-                }
+            VStack(spacing: 16) {
+                ProgressView()
+                Text("Preparing chat…")
+                    .foregroundStyle(.secondary)
             }
-        } else if conversations.isEmpty && !isLoading {
+            .task(id: convo.id) {
+                // A fallback only: selecting a chat already builds its view model.
+                guard selection?.id == convo.id else { return }
+                openViewModel(for: convo)
+            }
+        } else if conversations.isEmpty {
             VStack(spacing: 16) {
                 Image(systemName: "plus.bubble.right")
                     .font(.system(size: 48))
@@ -537,7 +312,7 @@ struct ContentView: View {
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                
+
                 Button("New Chat") {
                     startDraftChat()
                 }
@@ -547,44 +322,33 @@ struct ContentView: View {
             .padding()
         } else {
             VStack(spacing: 16) {
-                if isLoading {
-                    ProgressView()
-                        .scaleEffect(1.2)
-                    Text("Loading...")
-                        .font(.headline)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Image(systemName: "bubble.left.and.bubble.right")
-                        .font(.system(size: 48))
-                        .foregroundStyle(.secondary)
-                    Text("Select a Conversation")
-                        .font(.title2)
-                        .fontWeight(.semibold)
-                    Text("Choose a chat from the sidebar to continue")
-                        .font(.body)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.system(size: 48))
+                    .foregroundStyle(.secondary)
+                Text("Select a Conversation")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                Text("Choose a chat from the sidebar to continue")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
             .padding()
         }
     }
 
-    private var filteredConversations: [Conversation] {
-        let trimmed = debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return conversations }
-
-        let searchTerms = trimmed.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
-        guard !searchTerms.isEmpty else { return conversations }
-
-        return conversations.filter { $0.matchesSearch(searchTerms) }
+    private var searchTerms: [String] {
+        debouncedSearchText
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
     }
 
     @ViewBuilder
     private var sidebar: some View {
         ConversationSidebar(
-            // One pass over the (potentially expensive) search filter per render.
-            sections: ConversationRecencySection.grouping(filteredConversations),
+            // Cached: ContentView renders several times a second while a reply streams,
+            // and the search filter reads every message of every chat.
+            sections: sidebarSectionsCache.sections(for: conversations, searchTerms: searchTerms),
             hasConversations: !conversations.isEmpty,
             selectedID: selection?.id,
             selection: $selection,
@@ -602,16 +366,9 @@ struct ContentView: View {
                 }
             },
             onShowSettings: { showSettings = true },
-            onRename: { convo in
-                if let conversation = conversations.first(where: { $0.id == convo.id }) {
-                    rename(conversation)
-                }
-            },
-            onDelete: { convo in
-                if let conversation = conversations.first(where: { $0.id == convo.id }) {
-                    delete(conversation)
-                }
-            }
+            onRename: rename,
+            // The sidebar has already asked the user to confirm.
+            onDelete: delete
         )
         .equatable()
         .onChange(of: searchText) { _, newValue in
@@ -629,16 +386,20 @@ struct ContentView: View {
         }
     }
 
-    // Pure creator that does not mutate state; we call it from .task or lifecycle hooks.
-    private func createViewModel(for conversation: Conversation) -> ChatViewModel {
-        // Reuse existing view model if it's for the same conversation
-        if let existing = currentViewModel, existing.conversation.id == conversation.id {
-            return existing
-        }
-        
-        // Create new view model
-        let generator: LLMGenerator = OnDeviceLLMGenerator()
-        return ChatViewModel(generator: generator, context: modelContext, conversation: conversation)
+    private func makeViewModel(for conversation: Conversation) -> ChatViewModel {
+        let viewModel = ChatViewModel(generator: OnDeviceLLMGenerator(), context: modelContext, conversation: conversation)
+        #if DEBUG
+        seedComposerImageIfNeeded(into: viewModel)
+        #endif
+        return viewModel
+    }
+
+    /// Opens a saved chat's view model, retiring the previous chat's. Keeps the current
+    /// one when it already belongs to this chat.
+    private func openViewModel(for conversation: Conversation) {
+        guard currentViewModel?.conversation.id != conversation.id else { return }
+        currentViewModel?.deactivate()
+        currentViewModel = makeViewModel(for: conversation)
     }
 
     private func closeSidebar() {
@@ -650,24 +411,23 @@ struct ContentView: View {
 
     private func startDraftChat(withHaptics: Bool = true) {
         // Only one draft at a time — the button is disabled when a draft is already open.
-        // From the sidebar, New Chat just reveals the draft that is already open.
-        guard draftConversation == nil else {
+        // From the sidebar, New Chat just reveals the draft that is already open. This runs
+        // synchronously, so a second tap always sees the first tap's draft.
+        guard ChatNavigationRules.newChatCreatesDraft(draftID: draftConversation?.id) else {
             closeSidebar()
             return
         }
         if withHaptics {
             AppHaptics.impact(.medium)
         }
-        Task { @MainActor in
-            openDraftChat()
-            closeSidebar()
-            if !searchText.isEmpty {
-                clearSearch()
-            }
+        openDraftChat()
+        closeSidebar()
+        if !searchText.isEmpty {
+            clearSearch()
         }
     }
 
-    private func openDraftChat() {
+    func openDraftChat() {
         currentViewModel?.deactivate()
         let convo = Conversation(
             title: String(localized: "New Chat", bundle: .appLocalized),
@@ -679,11 +439,9 @@ struct ContentView: View {
         convo.preferredModelID = backendBridge.selectedModelID
         // Set draft BEFORE clearing selection so handleSelectionChange preserves this vm.
         draftConversation = convo
-        currentViewModel = createViewModel(for: convo)
+        currentViewModel = makeViewModel(for: convo)
         backendBridge.bindConversation(convo)
         selection = nil
-        // Push detail column on compact (iPhone) so the draft chat is immediately visible.
-        preferredCompactColumn = .detail
     }
 
     private func clearSearch() {
@@ -693,112 +451,6 @@ struct ContentView: View {
         isSearchPresented = false
     }
 
-    private func rename(_ conversation: Conversation) {
-        // Renaming mid-reply is fine: auto-naming leaves a user's title alone.
-        guard conversations.contains(where: { $0.id == conversation.id }) else { return }
-        
-        // Localized inline rename via alert-style prompt
-        let alert = UIAlertController(
-            title: String(localized: "Rename Chat", bundle: .appLocalized),
-            message: String(localized: "Enter a new name for this conversation", bundle: .appLocalized),
-            preferredStyle: .alert
-        )
-        
-        alert.addTextField { textField in
-            textField.text = conversation.title
-            textField.placeholder = String(localized: "Conversation Title", bundle: .appLocalized)
-            textField.autocapitalizationType = .words
-            textField.returnKeyType = .done
-            textField.clearButtonMode = .whileEditing
-        }
-        
-        alert.addAction(UIAlertAction(title: String(localized: "Cancel", bundle: .appLocalized), style: .cancel))
-        alert.addAction(UIAlertAction(title: String(localized: "Save", bundle: .appLocalized), style: .default) { _ in
-            guard let textField = alert.textFields?.first,
-                  let newTitle = textField.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !newTitle.isEmpty,
-                  newTitle != conversation.title else {
-                return
-            }
-            
-            // Renaming isn't new activity, so leave lastUpdated alone and keep
-            // the chat where it is in the sidebar.
-            conversation.title = newTitle
-            conversation.hasAutoGeneratedTitle = false
-            
-            do {
-                try self.modelContext.save()
-                AppHaptics.notification(.success)
-            } catch {
-                contentLogger.error("Failed to save renamed conversation: \((error as NSError).localizedDescription, privacy: .public)")
-                AppHaptics.notification(.error)
-                self.errorMessage = String(localized: "Failed to rename conversation. Please try again.", bundle: .appLocalized)
-            }
-        })
-        
-        // Present alert safely
-        DispatchQueue.main.async {
-            UIApplication.shared.topMostViewController()?.present(alert, animated: true)
-        }
-    }
-
-    private func delete(_ conversation: Conversation) {
-        // CRITICAL FIX: Eagerly resolve all properties before deletion to avoid SwiftData fault errors
-        // Capture ID and resolve all message faults to prevent "detached from context" errors
-        let conversationID = conversation.id
-        
-        // Force resolution of message properties that might be accessed during UI updates
-        // This prevents fault errors during the deletion animation
-        _ = conversation.messages.map { msg in
-            // Eagerly access properties to resolve any faults
-            _ = msg.role
-            _ = msg.text
-            _ = msg.order
-        }
-        
-        // Ensure we're not trying to delete a conversation that's already been deleted
-        guard conversations.contains(where: { $0.id == conversationID }) else { return }
-        let excludedConversationIDs: Set<UUID> = [conversationID]
-        let attachmentURLsToDelete = attachmentURLs(in: [conversation])
-        
-        AppHaptics.impact(.medium)
-        
-        // Cancel any ongoing operations for this conversation - do this BEFORE updating selection
-        if let currentVM = currentViewModel, currentVM.conversation.id == conversationID {
-            currentVM.deactivate()
-            // Clear the view model reference immediately
-            currentViewModel = nil
-        }
-        
-        // Deleting the open chat replaces it with a blank one behind the sidebar,
-        // so the user never lands on an empty placeholder.
-        if selection?.id == conversationID {
-            openDraftChat()
-        }
-        
-        // Wrap deletion in animation to ensure smooth UI updates
-        withAnimation {
-            modelContext.delete(conversation)
-        }
-        
-        do {
-            try modelContext.save()
-            deleteAttachmentFiles(attachmentURLsToDelete)
-            scheduleAttachmentStorageCleanup(excludingConversationIDs: excludedConversationIDs)
-            AppHaptics.notification(.success)
-        } catch {
-            contentLogger.error("Failed to save after deleting conversation: \((error as NSError).localizedDescription, privacy: .public)")
-            AppHaptics.notification(.error)
-            errorMessage = String(localized: "Failed to delete conversation. Please try again.", bundle: .appLocalized)
-            
-            // Try to recover by reloading the context
-            do {
-                try modelContext.save()
-            } catch {
-                contentLogger.error("Failed to recover after delete error: \((error as NSError).localizedDescription, privacy: .public)")
-            }
-        }
-    }
 
     // Wait for the cover to dismiss before exporting or showing action errors.
     // Deletion has already been confirmed inside Settings.
@@ -816,263 +468,6 @@ struct ContentView: View {
         case .export: exportAllChats()
         case nil: break
         }
-    }
-
-    private func deleteAllChats() {
-        Task {
-            await deleteAllChatsAfterStoppingGeneration()
-        }
-    }
-
-    private func deleteAllChatsAfterStoppingGeneration() async {
-        AppHaptics.impact(.heavy)
-
-        let conversationsToDelete = Array(conversations)
-        let conversationIDsToDelete = Set(conversationsToDelete.map(\.id))
-        guard await stopGenerationBeforeDeleting(conversationIDs: conversationIDsToDelete) else {
-            return
-        }
-
-        // stopGenerationBeforeDeleting retired the open chat's view model if it
-        // is being deleted. An open draft is unaffected and stays as it is;
-        // otherwise replace the deleted chat with a blank one, as a single
-        // delete does. Clearing the view model under a draft would strand the
-        // UI: New Chat only reveals an existing draft.
-        if draftConversation == nil {
-            openDraftChat()
-        }
-
-        let excludedConversationIDs = conversationIDsToDelete
-        let attachmentURLsToDelete = attachmentURLs(in: conversationsToDelete)
-        
-        // Delete everything
-        for convo in conversationsToDelete {
-            modelContext.delete(convo)
-        }
-        
-        do {
-            try modelContext.save()
-            deleteAttachmentFiles(attachmentURLsToDelete)
-            scheduleAttachmentStorageCleanup(excludingConversationIDs: excludedConversationIDs)
-            AppHaptics.notification(.success)
-        } catch {
-            contentLogger.error("Failed to save after deleting all conversations: \((error as NSError).localizedDescription, privacy: .public)")
-            AppHaptics.notification(.error)
-            errorMessage = String(localized: "Failed to delete all conversations. Please try again.", bundle: .appLocalized)
-        }
-    }
-
-    private func deleteAllExceptCurrent() {
-        Task {
-            await deleteAllExceptCurrentAfterStoppingGeneration()
-        }
-    }
-
-    private func deleteAllExceptCurrentAfterStoppingGeneration() async {
-        AppHaptics.impact(.heavy)
-        
-        // If there's a selection, keep it; otherwise keep the most recent conversation
-        let current = selection ?? conversations.first
-        
-        guard let current = current else {
-            // No conversations at all
-            deleteAllChats()
-            return
-        }
-        
-        let conversationsToDelete = conversations.filter { $0.id != current.id }
-        guard !conversationsToDelete.isEmpty else { return }
-        let excludedConversationIDs = Set(conversationsToDelete.map(\.id))
-        let attachmentURLsToDelete = attachmentURLs(in: conversationsToDelete)
-
-        guard await stopGenerationBeforeDeleting(conversationIDs: excludedConversationIDs) else {
-            return
-        }
-        
-        for convo in conversationsToDelete {
-            modelContext.delete(convo)
-        }
-        
-        do {
-            try modelContext.save()
-            deleteAttachmentFiles(attachmentURLsToDelete)
-            scheduleAttachmentStorageCleanup(excludingConversationIDs: excludedConversationIDs)
-            AppHaptics.notification(.success)
-            // Ensure the kept conversation is selected after deletion
-            selection = current
-        } catch {
-            contentLogger.error("Failed to save after deleting conversations except current: \((error as NSError).localizedDescription, privacy: .public)")
-            AppHaptics.notification(.error)
-            errorMessage = String(localized: "Failed to delete conversations. Please try again.", bundle: .appLocalized)
-        }
-    }
-
-    private func exportAllChats() {
-        guard !conversations.isEmpty else { return }
-        cleanupExportFile()
-        
-        let exportText = ChatExportFormatter.text(for: conversations)
-        let fileName = ChatExportFormatter.fileName()
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
-        
-        do {
-            let exportData = Data(exportText.utf8)
-            try exportData.write(to: tempURL, options: [.atomic, .completeFileProtection])
-            exportURL = tempURL
-            chatExport = ChatExport(url: tempURL)
-        } catch {
-            errorMessage = String(localized: "Failed to export chats. Please try again.", bundle: .appLocalized)
-        }
-    }
-
-    private func cleanupExportFile() {
-        guard let exportURL else { return }
-        try? FileManager.default.removeItem(at: exportURL)
-        self.exportURL = nil
-    }
-    
-    private func performAutoDeleteIfNeeded() {
-        Task {
-            await performAutoDeleteAfterStoppingGenerationIfNeeded()
-        }
-    }
-
-    /// Chats past the retention period. The open chat is kept until the user leaves it,
-    /// so coming back to the app never pulls a conversation out from under them.
-    static func conversationsToAutoDelete(
-        _ conversations: [Conversation],
-        olderThan cutoffDate: Date,
-        keeping openConversationID: UUID?
-    ) -> [Conversation] {
-        conversations.filter { $0.lastUpdated < cutoffDate && $0.id != openConversationID }
-    }
-
-    private func performAutoDeleteAfterStoppingGenerationIfNeeded() async {
-        guard autoDeleteOldChats, !isPerformingAutoDelete else { return }
-        isPerformingAutoDelete = true
-        defer { isPerformingAutoDelete = false }
-
-        let cutoffDate = Calendar.current.date(byAdding: .day, value: -autoDeleteDays, to: Date()) ?? Date()
-        let conversationsToDelete = Self.conversationsToAutoDelete(
-            conversations,
-            olderThan: cutoffDate,
-            keeping: selection?.id
-        )
-
-        guard !conversationsToDelete.isEmpty else { return }
-        let excludedConversationIDs = Set(conversationsToDelete.map(\.id))
-        let attachmentURLsToDelete = attachmentURLs(in: conversationsToDelete)
-
-        guard await stopGenerationBeforeDeleting(conversationIDs: excludedConversationIDs) else {
-            return
-        }
-        
-        // Delete old conversations
-        for convo in conversationsToDelete {
-            modelContext.delete(convo)
-        }
-        
-        do {
-            try modelContext.save()
-            deleteAttachmentFiles(attachmentURLsToDelete)
-            scheduleAttachmentStorageCleanup(excludingConversationIDs: excludedConversationIDs)
-            contentLogger.notice("Auto-deleted \(conversationsToDelete.count, privacy: .public) conversations older than \(autoDeleteDays, privacy: .public) days")
-        } catch {
-            contentLogger.error("Failed to auto-delete old conversations: \((error as NSError).localizedDescription, privacy: .public)")
-        }
-    }
-
-    private func stopGenerationBeforeDeleting(conversationIDs: Set<UUID>) async -> Bool {
-        while let viewModel = currentViewModel,
-              conversationIDs.contains(viewModel.conversation.id) {
-            guard await viewModel.cancelGenerationAndWait() else {
-                errorMessage = String(localized: "Couldn't stop the active response. Please try deleting again.", bundle: .appLocalized)
-                return false
-            }
-            viewModel.deactivate()
-            if currentViewModel === viewModel {
-                currentViewModel = nil
-            }
-        }
-        return true
-    }
-}
-
-// Owns the live settings snapshot. Each binding edit persists only changed fields;
-// dedicated editors keep API keys and response preferences local until Save.
-private struct SettingsSheetContainer: View {
-    let hasChats: Bool
-    let canDeleteAllExceptCurrent: Bool
-    let onDeleteAll: () -> Void
-    let onDeleteAllExceptCurrent: () -> Void
-    let onExportChats: () -> Void
-    let onDismiss: () -> Void
-
-    @State private var draft: AppSettingsDraft
-
-    init(
-        hasChats: Bool,
-        canDeleteAllExceptCurrent: Bool,
-        onDeleteAll: @escaping () -> Void,
-        onDeleteAllExceptCurrent: @escaping () -> Void,
-        onExportChats: @escaping () -> Void,
-        onDismiss: @escaping () -> Void
-    ) {
-        self.hasChats = hasChats
-        self.canDeleteAllExceptCurrent = canDeleteAllExceptCurrent
-        self.onDeleteAll = onDeleteAll
-        self.onDeleteAllExceptCurrent = onDeleteAllExceptCurrent
-        self.onExportChats = onExportChats
-        self.onDismiss = onDismiss
-        _draft = State(initialValue: AppSettingsDraft.load())
-    }
-
-    var body: some View {
-        NavigationStack {
-            SettingsSheet(
-                settings: Binding(
-                    get: { draft },
-                    set: { updated in
-                        updated.persist(comparedTo: draft)
-                        draft = updated
-                    }
-                ),
-                hasChats: hasChats,
-                canDeleteAllExceptCurrent: canDeleteAllExceptCurrent,
-                onDeleteAll: onDeleteAll,
-                onDeleteAllExceptCurrent: onDeleteAllExceptCurrent,
-                onExportChats: onExportChats
-            )
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
-                        onDismiss()
-                    }
-                    .accessibilityIdentifier("settings.done")
-                }
-            }
-        }
-        .environment(\.locale, AppLanguage.resolve(draft.appLanguage).locale)
-    }
-}
-
-// Helper to present UIAlertController in SwiftUI quickly
-private extension UIApplication {
-    func topMostViewController(base: UIViewController? = nil) -> UIViewController? {
-        let baseVC = base ?? connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first { $0.isKeyWindow }?.rootViewController
-        if let nav = baseVC as? UINavigationController {
-            return topMostViewController(base: nav.visibleViewController)
-        }
-        if let tab = baseVC as? UITabBarController, let selected = tab.selectedViewController {
-            return topMostViewController(base: selected)
-        }
-        if let presented = baseVC?.presentedViewController {
-            return topMostViewController(base: presented)
-        }
-        return baseVC
     }
 }
 
@@ -1103,29 +498,6 @@ private extension View {
             }
         } message: {
             Text(message)
-        }
-    }
-    
-    func settingsCover(
-        isPresented: Binding<Bool>,
-        hasChats: Bool,
-        canDeleteAllExceptCurrent: Bool,
-        onDeleteAll: @escaping () -> Void,
-        onDeleteAllExceptCurrent: @escaping () -> Void,
-        onExportChats: @escaping () -> Void,
-        onDismiss: @escaping () -> Void
-    ) -> some View {
-        sheet(isPresented: isPresented, onDismiss: onDismiss) {
-            SettingsSheetContainer(
-                hasChats: hasChats,
-                canDeleteAllExceptCurrent: canDeleteAllExceptCurrent,
-                onDeleteAll: onDeleteAll,
-                onDeleteAllExceptCurrent: onDeleteAllExceptCurrent,
-                onExportChats: onExportChats,
-                onDismiss: { isPresented.wrappedValue = false }
-            )
-            .presentationDetents([.large])
-            .presentationDragIndicator(.visible)
         }
     }
 }

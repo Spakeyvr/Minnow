@@ -10,15 +10,16 @@ import SwiftUI
 // MARK: - Inline thinking indicator shown during streaming
 
 struct InlineThinkingView: View {
-    var text: String = String(localized: "Thinking…", bundle: .appLocalized)
+    var text: String = Strings.thinking
     let onTap: (() -> Void)?
     /// Whether the shimmer plays. Stays on while reasoning streams, even once the label becomes tappable.
     var isAnimating: Bool = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    static let shimmerPeriod: TimeInterval = 1.6
+    /// Forwards to `ShimmerTiming`, which the view model also uses to time label changes.
+    static var shimmerPeriod: TimeInterval { ShimmerTiming.period }
     /// Half the width of the glow band, in unit-point space.
-    private static let shimmerBandHalfWidth: CGFloat = 0.25
+    private static var shimmerBandHalfWidth: CGFloat { ShimmerTiming.bandHalfWidth }
 
     var body: some View {
         Group {
@@ -42,21 +43,13 @@ struct InlineThinkingView: View {
 
     /// Sweeps from -0.4 to 1.4 once per period, phase-locked to the clock.
     static func shimmerOffset(at date: Date) -> CGFloat {
-        let phase = date.timeIntervalSinceReferenceDate
-            .truncatingRemainder(dividingBy: shimmerPeriod) / shimmerPeriod
-        return -0.4 + 1.8 * CGFloat(phase)
+        ShimmerTiming.offset(at: date)
     }
 
     /// Time until the glow band currently crossing the label has left it, or 0 when no band
     /// is over the label. Swapping the text then never cuts a sweep off mid-word.
     static func remainingSweepDuration(at date: Date) -> TimeInterval {
-        let offset = shimmerOffset(at: date)
-        let bandIsOverLabel = offset + shimmerBandHalfWidth > 0 && offset - shimmerBandHalfWidth < 1
-        guard bandIsOverLabel else { return 0 }
-        let phase = date.timeIntervalSinceReferenceDate
-            .truncatingRemainder(dividingBy: shimmerPeriod) / shimmerPeriod
-        let phaseWhenBandLeaves = (1 + shimmerBandHalfWidth + 0.4) / 1.8
-        return (Double(phaseWhenBandLeaves) - phase) * shimmerPeriod
+        ShimmerTiming.remainingSweepDuration(at: date)
     }
 
     @ViewBuilder
@@ -96,6 +89,102 @@ struct InlineThinkingView: View {
     }
 }
 
+// MARK: - Reasoning steps
+
+/// Splits sanitized reasoning into the steps the reasoning sheet shows.
+///
+/// Steps are separated by blank lines, but a blank line inside a fenced code
+/// block or a display formula does not end a step: splitting there would render
+/// half a fence or half a formula in each step. Search anchors count the
+/// blank-line pieces (see `ChatViewModel.reasoningPieceCount(for:)`), so each segment
+/// records which pieces it covers.
+nonisolated enum ReasoningStepSegmenter {
+    nonisolated struct Segment: Equatable, Sendable {
+        let text: String
+        /// The zero-based blank-line pieces this segment joins.
+        let pieces: ClosedRange<Int>
+    }
+
+    static func segments(from text: String) -> [Segment] {
+        let pieces = text
+            .components(separatedBy: "\n\n")
+            .filter { $0.contains(where: { !$0.isWhitespace }) }
+        var segments: [Segment] = []
+        var current: [String] = []
+        var firstPiece = 0
+        var openBlock = OpenBlockTracker()
+
+        for (index, piece) in pieces.enumerated() {
+            if !current.isEmpty, !openBlock.isOpen, !continuesPreviousPiece(piece) {
+                segments.append(Segment(text: joined(current), pieces: firstPiece...(index - 1)))
+                current.removeAll()
+                firstPiece = index
+            }
+            current.append(piece)
+            openBlock.consume(piece)
+        }
+        if !current.isEmpty {
+            segments.append(Segment(text: joined(current), pieces: firstPiece...(pieces.count - 1)))
+        }
+        return segments
+    }
+
+    /// An indented piece continues the list item above it.
+    private static func continuesPreviousPiece(_ piece: String) -> Bool {
+        piece.hasPrefix("  ") || piece.hasPrefix("\t")
+    }
+
+    private static func joined(_ pieces: [String]) -> String {
+        pieces.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Follows fences and display math across lines, with the parser's fence rules.
+    private struct OpenBlockTracker {
+        private var fence: MarkdownBlockParser.Fence?
+        private var mathCloser: String?
+
+        var isOpen: Bool { fence != nil || mathCloser != nil }
+
+        mutating func consume(_ piece: String) {
+            for line in piece.components(separatedBy: "\n") {
+                if let openFence = fence {
+                    if MarkdownBlockParser.isFenceClosing(line, fence: openFence) { fence = nil }
+                    continue
+                }
+                if let closer = mathCloser {
+                    if line.contains(closer) { mathCloser = nil }
+                    continue
+                }
+                if let opening = MarkdownBlockParser.fenceOpening(line) {
+                    fence = opening
+                    continue
+                }
+                mathCloser = Self.unclosedDisplayMath(startingLine: line)
+            }
+        }
+
+        /// The delimiter still owed by display math that starts this line, if any.
+        /// Mirrors the math document's block rule: only a display delimiter at
+        /// the start of a line may span blank lines.
+        private static func unclosedDisplayMath(startingLine line: String) -> String? {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("$$") {
+                return trimmed.dropFirst(2).contains("$$") ? nil : "$$"
+            }
+            if trimmed.hasPrefix("\\[") {
+                return trimmed.dropFirst(2).contains("\\]") ? nil : "\\]"
+            }
+            let begin = "\\begin{"
+            if trimmed.hasPrefix(begin), let close = trimmed.firstIndex(of: "}") {
+                let environment = trimmed[trimmed.index(trimmed.startIndex, offsetBy: begin.count)..<close]
+                let closer = "\\end{\(environment)}"
+                return trimmed.contains(closer) ? nil : closer
+            }
+            return nil
+        }
+    }
+}
+
 // MARK: - Step-by-Step Reasoning Sheet
 
 struct StepByStepReasoningSheet: View {
@@ -103,10 +192,13 @@ struct StepByStepReasoningSheet: View {
     @Environment(\.dismiss) private var dismiss
     let reasoning: String
     let searchInvocations: [SearchInvocation]?
+    /// Built once: sanitizing, splitting and ordering the searches are full passes
+    /// over the reasoning, and the rows are rendered from this list.
+    private let timelineItems: [TimelineItem]
     @State private var selectedInvocation: SearchInvocation?
     @State private var selectedDetent: PresentationDetent = .medium
 
-    private enum TimelineItem: Identifiable {
+    enum TimelineItem: Identifiable {
         case reasoningChunk(Int, String)
         case search(SearchInvocation)
 
@@ -120,8 +212,15 @@ struct StepByStepReasoningSheet: View {
         }
     }
 
-    private var timelineItems: [TimelineItem] {
-        let chunks = reasoningChunks
+    init(reasoning: String, searchInvocations: [SearchInvocation]?) {
+        self.reasoning = reasoning
+        self.searchInvocations = searchInvocations
+        self.timelineItems = Self.makeTimeline(reasoning: reasoning, searchInvocations: searchInvocations)
+    }
+
+    /// Reasoning steps interleaved with the searches anchored after them.
+    static func makeTimeline(reasoning: String, searchInvocations: [SearchInvocation]?) -> [TimelineItem] {
+        let segments = ReasoningStepSegmenter.segments(from: ReasoningTextSanitizer.string(from: reasoning))
         let searches = (searchInvocations ?? []).sorted { lhs, rhs in
             if lhs.anchorStepNumber == rhs.anchorStepNumber {
                 return lhs.timestamp < rhs.timestamp
@@ -129,7 +228,7 @@ struct StepByStepReasoningSheet: View {
             return (lhs.anchorStepNumber ?? 0) < (rhs.anchorStepNumber ?? 0)
         }
 
-        guard !chunks.isEmpty else {
+        guard let pieceCount = segments.last.map({ $0.pieces.upperBound + 1 }) else {
             return searches.map(TimelineItem.search)
         }
 
@@ -138,35 +237,20 @@ struct StepByStepReasoningSheet: View {
         let leadingSearches = searches.filter { ($0.anchorStepNumber ?? 0) <= 0 }
         items.append(contentsOf: leadingSearches.map(TimelineItem.search))
 
-        for (index, chunk) in chunks.enumerated() {
-            items.append(.reasoningChunk(chunk.index, chunk.text))
-            let anchoredSearches = searches.filter { $0.anchorStepNumber == index + 1 }
+        for segment in segments {
+            items.append(.reasoningChunk(segment.pieces.lowerBound, segment.text))
+            // A search anchored after piece N follows the segment holding piece N.
+            let anchoredSearches = searches.filter {
+                guard let anchor = $0.anchorStepNumber else { return false }
+                return segment.pieces.contains(anchor - 1)
+            }
             items.append(contentsOf: anchoredSearches.map(TimelineItem.search))
         }
 
-        let trailingSearches = searches.filter { ($0.anchorStepNumber ?? 0) > chunks.count }
+        let trailingSearches = searches.filter { ($0.anchorStepNumber ?? 0) > pieceCount }
         items.append(contentsOf: trailingSearches.map(TimelineItem.search))
 
         return items
-    }
-
-    private var sanitizedReasoning: String {
-        ReasoningTextSanitizer.string(from: reasoning)
-    }
-
-    private var reasoningChunks: [(index: Int, text: String)] {
-        let trimmed = sanitizedReasoning
-        guard !trimmed.isEmpty else { return [] }
-        let chunks = trimmed
-            .components(separatedBy: "\n\n")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        if chunks.isEmpty {
-            return [(0, trimmed)]
-        }
-
-        return Array(chunks.enumerated()).map { ($0.offset, $0.element) }
     }
 
     var body: some View {
@@ -174,13 +258,16 @@ struct StepByStepReasoningSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     if !timelineItems.isEmpty {
-                        VStack(alignment: .leading, spacing: 14) {
+                        let lastIndex = timelineItems.count - 1
+                        // Lazy: a long trace builds only the steps on screen, and so
+                        // only those holding math take a web view.
+                        LazyVStack(alignment: .leading, spacing: 14) {
                             ForEach(Array(timelineItems.enumerated()), id: \.element.id) { index, item in
                                 switch item {
                                 case .reasoningChunk(_, let text):
                                     RawReasoningChunkView(
                                         text: text,
-                                        isLast: index == timelineItems.count - 1
+                                        isLast: index == lastIndex
                                     )
                                 case .search(let invocation):
                                     SearchStepCard(invocation: invocation) {
@@ -188,23 +275,9 @@ struct StepByStepReasoningSheet: View {
                                             selectedInvocation = invocation
                                         }
                                     }
-                                    .padding(.bottom, index == timelineItems.count - 1 ? 0 : 20)
+                                    .padding(.bottom, index == lastIndex ? 0 : 20)
                                 }
                             }
-                        }
-                    } else if !sanitizedReasoning.isEmpty {
-                        VStack(alignment: .leading, spacing: 12) {
-                            RichMarkdownView(
-                                text: sanitizedReasoning,
-                                fontSize: UIFont.preferredFont(forTextStyle: .body).pointSize
-                            )
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .padding()
-                        .background {
-                            RoundedRectangle(cornerRadius: DesignTokens.CornerRadius.medium, style: .continuous)
-                                .fill(.regularMaterial)
                         }
                     } else {
                         Text("No reasoning content available.")
@@ -242,14 +315,12 @@ struct RawReasoningChunkView: View {
     @AppStorage(AppSettingsKeys.messageFontSize) private var messageFontSize: Double = 16.0
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            RichMarkdownView(
-                text: text,
-                fontSize: messageFontSize
-            )
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
+        RichMarkdownView(
+            text: text,
+            fontSize: messageFontSize
+        )
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, isLast ? 0 : 20)
     }
 }

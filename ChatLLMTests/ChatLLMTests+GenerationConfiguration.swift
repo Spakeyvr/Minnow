@@ -50,8 +50,7 @@ extension ChatLLMTests {
 
     @Test func generationConfigurationUsesDensePersistentCacheWhenRotorQuantIsNotPreferred() {
         let configuration = MLXModelManager.generationConfiguration(
-            isEnabled: true,
-            preferRotorQuant: false,
+            rotorQuantEnabled: false,
             hasTools: true,
             hasMedia: false,
             memoryConstrained: false,
@@ -66,10 +65,29 @@ extension ChatLLMTests {
         #expect(configuration.cacheCompression == .none)
     }
 
+    @Test func memoryConstrainedThinkingTurnsKeepTheirOutputBudgetButStayBounded() {
+        func configuration(enableThinking: Bool) -> MLXModelManager.GenerationConfiguration {
+            MLXModelManager.generationConfiguration(
+                rotorQuantEnabled: true,
+                hasTools: false,
+                hasMedia: false,
+                enableThinking: enableThinking,
+                memoryConstrained: true,
+                prefersBoundedCache: false,
+                configuredMaxOutputTokens: 4096,
+                configuredContextWindow: 32768
+            )
+        }
+
+        #expect(configuration(enableThinking: false).maxTokens == MLXModelManager.memoryConstrainedMaxOutputTokens)
+        let thinking = configuration(enableThinking: true)
+        #expect(thinking.maxTokens == 4096)
+        #expect(thinking.maxKVSize == 4096)
+    }
+
     @Test func generationConfigurationRespectsConfiguredToolOutputLimitWhenRotorQuantIsOff() {
         let configuration = MLXModelManager.generationConfiguration(
-            isEnabled: false,
-            preferRotorQuant: false,
+            rotorQuantEnabled: false,
             hasTools: true,
             hasMedia: false,
             memoryConstrained: false,
@@ -86,8 +104,7 @@ extension ChatLLMTests {
 
     @Test func generationConfigurationKeepsToolAndMediaTurnsOnSimpleCacheWhenRotorQuantIsOn() {
         let configuration = MLXModelManager.generationConfiguration(
-            isEnabled: true,
-            preferRotorQuant: true,
+            rotorQuantEnabled: true,
             hasTools: true,
             hasMedia: true,
             memoryConstrained: false,
@@ -104,8 +121,7 @@ extension ChatLLMTests {
 
     @Test func generationConfigurationUsesBoundedRotatingCacheOnLowMemoryDevicesWithTools() {
         let configuration = MLXModelManager.generationConfiguration(
-            isEnabled: true,
-            preferRotorQuant: false,
+            rotorQuantEnabled: false,
             hasTools: true,
             hasMedia: false,
             memoryConstrained: false,
@@ -122,8 +138,7 @@ extension ChatLLMTests {
 
     @Test func generationConfigurationUsesBoundedRotatingCacheOnLowMemoryDevicesWithMedia() {
         let configuration = MLXModelManager.generationConfiguration(
-            isEnabled: true,
-            preferRotorQuant: false,
+            rotorQuantEnabled: false,
             hasTools: false,
             hasMedia: true,
             memoryConstrained: false,
@@ -140,8 +155,7 @@ extension ChatLLMTests {
 
     @Test func generationConfigurationClampsLowMemoryMaxKVSizeToConfiguredContextWindow() {
         let configuration = MLXModelManager.generationConfiguration(
-            isEnabled: true,
-            preferRotorQuant: false,
+            rotorQuantEnabled: false,
             hasTools: false,
             hasMedia: false,
             memoryConstrained: false,
@@ -158,8 +172,7 @@ extension ChatLLMTests {
     @Test func raisedContextWindowLimitGrowsTheLowMemorySlidingWindow() {
         let configuration = { (contextWindowLimitRaised: Bool) in
             MLXModelManager.generationConfiguration(
-                isEnabled: true,
-                preferRotorQuant: true,
+                rotorQuantEnabled: true,
                 hasTools: false,
                 hasMedia: false,
                 memoryConstrained: false,

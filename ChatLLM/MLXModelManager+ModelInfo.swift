@@ -12,6 +12,44 @@ extension MLXModelManager {
     // MARK: - Model Info
 
     struct MLXModelInfo: Identifiable, Sendable {
+        /// The checkpoint family. Sampling defaults, chat-template quirks and
+        /// the tool-loop style follow from it, so behavior is keyed on this
+        /// instead of model-ID strings scattered across files.
+        nonisolated enum Family: Equatable, Sendable {
+            case qwen35
+            case lfm25
+            case other
+
+            /// Catalog IDs are `<family>-<size>-...`; this is the one place
+            /// that maps those prefixes to a family.
+            init(modelID: String) {
+                if modelID.hasPrefix("qwen3.5-") {
+                    self = .qwen35
+                } else if modelID.hasPrefix("lfm2.5-") {
+                    self = .lfm25
+                } else {
+                    self = .other
+                }
+            }
+
+            /// The chat template always opens a thinking block.
+            var alwaysOpensThinkingBlock: Bool { self == .lfm25 }
+
+            /// Expects tool results as a user turn wrapped in `<tool_response>`.
+            var prefersUserWrappedToolResponses: Bool { self == .qwen35 }
+
+            /// Replays each tool round (assistant call, then result) as LFM2.5's
+            /// template renders it.
+            var usesLFMToolTurns: Bool { self == .lfm25 }
+
+            var supportsReasoning: Bool { self != .other }
+
+            /// Whether a persistent session can append the next turn. LFM2.5's
+            /// template prepends BOS on every render, so a reused session would
+            /// put a BOS token in the middle of the conversation.
+            var continuesPersistentSessions: Bool { self != .lfm25 }
+        }
+
         enum LoadPolicy: Equatable, Sendable {
             case standard
             case qwenMultimodal
@@ -45,6 +83,7 @@ extension MLXModelManager {
         }
 
         let id: String
+        let family: Family
         let name: String
         let localDirName: String
         let hfRepoId: String
@@ -87,9 +126,11 @@ extension MLXModelManager {
             requiredProcessorClass: String? = nil,
             minimumPhoneMemoryBytes: UInt64? = nil,
             minimumPhoneMemoryForToolCallsBytes: UInt64? = nil,
-            phoneContextWindowOverride: [Int: Int]? = nil
+            phoneContextWindowOverride: [Int: Int]? = nil,
+            family: Family? = nil
         ) {
             self.id = id
+            self.family = family ?? Family(modelID: id)
             self.name = name
             self.localDirName = localDirName
             self.hfRepoId = hfRepoId
@@ -114,7 +155,7 @@ extension MLXModelManager {
         }
 
         /// This checkpoint always opens a thinking block in its chat template.
-        var requiresReasoning: Bool { id == "lfm2.5-2.6b-4bit" }
+        var requiresReasoning: Bool { family.alwaysOpensThinkingBlock }
 
         func downloadSize(locale: Locale) -> String {
             downloadSizeBytes.map { $0.formatted(.byteCount(style: .file).locale(locale)) } ?? downloadSizeLabel

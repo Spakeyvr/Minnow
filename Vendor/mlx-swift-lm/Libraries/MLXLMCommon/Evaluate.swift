@@ -442,15 +442,29 @@ public struct RepetitionContext: LogitProcessor, @unchecked Sendable {
 
 /// Processor that applies a presence penalty to any token already seen in the prompt or output.
 ///
-/// Like ``RepetitionContext`` this keeps sampled tokens on the GPU so the
-/// processor never forces a synchronous evaluation of the decode step.
-/// Sampled tokens are appended without de-duplication; the penalty is applied
-/// with a gather followed by an assigning scatter, so a repeated index writes
-/// the same penalized value and is still penalized exactly once.
+/// ChatLLM patch: the penalty lives in a vocabulary-sized vector holding
+/// `presencePenalty` at every seen token and 0 elsewhere. Each sampled token
+/// is one scatter into it and `process` is one subtraction, so per-token cost
+/// stays constant instead of growing with an index list that gained an entry
+/// (and a full copy) every token. Like ``RepetitionContext`` everything stays
+/// on the GPU, so the processor never forces a synchronous evaluation of the
+/// decode step.
+///
+/// The vocabulary size is only known from the first logits, so tokens seen
+/// before then are kept until `process` builds the vector. That state is in a
+/// reference, because `process` is non-mutating; a processor is owned by a
+/// single ``TokenIterator`` and is not copied while in use.
 ///
 /// `@unchecked Sendable` for the same reason as ``RepetitionContext``.
 public struct PresenceContext: LogitProcessor, @unchecked Sendable {
-    var seenTokens: MLXArray?
+    private final class State {
+        /// Seen token IDs not yet written into `penalties`.
+        var pendingTokens: MLXArray?
+        /// `[vocabulary]`: `presencePenalty` at seen tokens, 0 elsewhere.
+        var penalties: MLXArray?
+    }
+
+    private let state = State()
     let presencePenalty: Float
 
     public init(presencePenalty: Float) {
@@ -458,26 +472,34 @@ public struct PresenceContext: LogitProcessor, @unchecked Sendable {
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
-        // The prompt is already materialized, so de-duplicating it on the CPU
-        // is a one-time cost that keeps the per-token index set small.
-        let unique = Set(prompt.asArray(Int.self))
-        guard !unique.isEmpty else { return }
-        let promptTokens = MLXArray(unique.sorted().map(UInt32.init))
-        seenTokens = seenTokens.map { concatenated([$0, promptTokens]) } ?? promptTokens
+        markSeen(prompt.reshaped(-1).asType(.uint32))
     }
 
     public func process(logits: MLXArray) -> MLXArray {
-        guard let seenTokens else { return logits }
-
-        var selectedLogits = logits[0..., seenTokens]
-        selectedLogits -= MLXArray(presencePenalty)
-        logits[0..., seenTokens] = selectedLogits
-        return logits
+        let vocabularySize = logits.dim(-1)
+        if state.penalties?.dim(0) != vocabularySize {
+            guard let pending = state.pendingTokens else { return logits }
+            let penalties = MLXArray.zeros([vocabularySize], dtype: logits.dtype)
+            penalties[pending] = MLXArray(presencePenalty).asType(logits.dtype)
+            state.penalties = penalties
+            state.pendingTokens = nil
+        }
+        guard let penalties = state.penalties else { return logits }
+        return logits - penalties
     }
 
     mutating public func didSample(token: MLXArray) {
-        let sampled = token.reshaped(-1).asType(.uint32)
-        seenTokens = seenTokens.map { concatenated([$0, sampled]) } ?? sampled
+        markSeen(token.reshaped(-1).asType(.uint32))
+    }
+
+    private func markSeen(_ tokens: MLXArray) {
+        guard tokens.size > 0 else { return }
+        if let penalties = state.penalties {
+            penalties[tokens] = MLXArray(presencePenalty).asType(penalties.dtype)
+            state.penalties = penalties
+        } else {
+            state.pendingTokens = state.pendingTokens.map { concatenated([$0, tokens]) } ?? tokens
+        }
     }
 }
 
@@ -710,8 +732,13 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
             // Cache updates are functional MLX operations. Evaluate their state
             // alongside the token so lazy update chains do not retain every
-            // previous decode step's intermediates.
-            asyncEval([token] + cache.flatMap { $0.state })
+            // previous decode step's intermediates. ChatLLM patch: the backing
+            // buffers (`innerState`) rather than `state`, whose getters build
+            // new slice arrays per layer on every token.
+            asyncEval([token] + cache.flatMap { layer in
+                let buffers = layer.innerState()
+                return buffers.isEmpty ? layer.state : buffers
+            })
 
             tokenCount += 1
 

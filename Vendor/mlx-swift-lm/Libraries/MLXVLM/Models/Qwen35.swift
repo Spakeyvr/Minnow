@@ -1319,6 +1319,9 @@ public class Qwen35: Module, VLMModel {
                 var remaining = input.text
                 var segmentOffset = typedCache?[languageModel.model.faIdx].offset ?? 0
                 while remaining.tokens.dim(-1) > 0 {
+                    // ChatLLM: stop between chunks so a cancelled generation
+                    // does not finish a multi-second prefill first.
+                    try Task.checkCancellation()
                     let chunkLength = min(chunkSize, remaining.tokens.dim(-1))
                     let chunk = remaining[.ellipsis, ..<chunkLength]
                     let chunkPositions = broadcast(

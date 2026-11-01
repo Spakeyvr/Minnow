@@ -6,7 +6,14 @@
 //
 
 import CryptoKit
+import Darwin
 import Foundation
+import OSLog
+
+nonisolated private let modelDownloadLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "ChatLLM",
+    category: "ModelDownloader"
+)
 
 actor ModelDownloader {
 
@@ -27,18 +34,30 @@ actor ModelDownloader {
         let transferID: String
     }
 
+    private struct TransferProgress: Sendable {
+        let transferID: String
+        let bytesWritten: Int64
+        let serverExpectedBytes: Int64
+        let declaredExpectedBytes: Int64
+    }
+
     private static let hfApiBase     = "https://huggingface.co/api"
     private static let hfResolveBase = "https://huggingface.co"
-    private static let minProgressInterval: Double = 0.01  // report at most every 1% change
     private static let disallowedRemotePathComponents: Set<String> = [".", ".."]
+    private static let metadataTimeout: TimeInterval = 30
+    private static let metadataRetryCount = 1
+    private static let metadataRetryDelay: Duration = .milliseconds(500)
+    private static let verifiedChecksumAttribute = "com.nevio.chatllm.verified-sha256"
     private let backgroundSession = BackgroundModelDownloadSession.shared
+    private let metadataSession: URLSession
 
-    /// Last value handed to `onProgress`. Actor state rather than a local so the
-    /// in-flight delegate callbacks share one throttle with the per-file path.
-    private var lastReportedProgress: Double = -1
-    private var activeProgressRunID: UUID?
-    private var transferBytesByID: [String: Int64] = [:]
-    private var transferFractionsByID: [String: Double] = [:]
+    /// Shared by the in-flight delegate callbacks and the per-file path, so
+    /// the reported value only moves forward.
+    private var progressReporter = DownloadProgressReporter()
+
+    init(metadataSession: URLSession = .shared) {
+        self.metadataSession = metadataSession
+    }
 
     // MARK: - File List
 
@@ -46,10 +65,37 @@ actor ModelDownloader {
         guard let url = Self.metadataURL(repoId: repoId, revision: revision) else {
             throw DownloadError.badResponse
         }
-        let (data, response) = try await URLSession.shared.data(from: url)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw DownloadError.badResponse
+        var request = URLRequest(url: url, timeoutInterval: Self.metadataTimeout)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        var attempt = 0
+        while true {
+            do {
+                let (data, response) = try await metadataSession.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw DownloadError.badResponse
+                }
+                if http.statusCode == 200 {
+                    return try Self.parseFileList(from: data)
+                }
+                if (500...599).contains(http.statusCode), attempt < Self.metadataRetryCount {
+                    attempt += 1
+                    try await Task.sleep(for: Self.metadataRetryDelay)
+                    continue
+                }
+                throw DownloadError.metadataHTTPStatus(http.statusCode)
+            } catch let error as URLError where error.isTransientConnectivityFailure
+                && attempt < Self.metadataRetryCount {
+                attempt += 1
+                modelDownloadLogger.notice(
+                    "Retrying model file list after a transient network error: code=\(error.code.rawValue, privacy: .public)"
+                )
+                try await Task.sleep(for: Self.metadataRetryDelay)
+            }
         }
+    }
+
+    internal static func parseFileList(from data: Data) throws -> [RemoteFile] {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let siblings = json["siblings"] as? [[String: Any]] else {
             return []
@@ -91,9 +137,13 @@ actor ModelDownloader {
         let fileCount = files.count
         var totalWritten: Int64 = 0
         var filesCompleted = 0
-        lastReportedProgress = -1
+        progressReporter = DownloadProgressReporter()
 
         try FileManager.default.createDirectory(at: targetDir, withIntermediateDirectories: true)
+        // Weights can be downloaded again, so they stay out of iCloud and
+        // device backups. The flag covers everything inside the folder and
+        // moves with it when the finished download is renamed into place.
+        Self.excludeFromBackup(targetDir)
 
         let plans = try files.map { file in
             try Task.checkCancellation()
@@ -127,7 +177,7 @@ actor ModelDownloader {
         for plan in plans {
             try Task.checkCancellation()
 
-            if try reuseCompletedFileIfPossible(
+            if try await Self.reuseCompletedFileIfPossible(
                 destination: plan.destinationURL,
                 temporary: plan.temporaryURL,
                 expectedSize: plan.size,
@@ -136,7 +186,7 @@ actor ModelDownloader {
                 let actualSize = Self.fileSize(at: plan.destinationURL) ?? plan.size
                 totalWritten += actualSize
                 filesCompleted += 1
-                let progress = computeProgress(
+                let progress = Self.computeProgress(
                     totalWritten: totalWritten,
                     totalExpected: totalExpected,
                     filesCompleted: filesCompleted,
@@ -149,45 +199,54 @@ actor ModelDownloader {
             pendingPlans.append(plan)
         }
 
-        let progressRunID = UUID()
-        activeProgressRunID = progressRunID
-        transferBytesByID.removeAll(keepingCapacity: true)
-        transferFractionsByID.removeAll(keepingCapacity: true)
-        defer {
-            if activeProgressRunID == progressRunID {
-                activeProgressRunID = nil
-                transferBytesByID.removeAll(keepingCapacity: true)
-                transferFractionsByID.removeAll(keepingCapacity: true)
+        // One consumer drains every transfer's progress in order, instead of
+        // one Task per URLSession chunk callback.
+        let (progressUpdates, progressContinuation) = AsyncStream.makeStream(
+            of: TransferProgress.self,
+            bufferingPolicy: .bufferingNewest(256)
+        )
+        let aggregator = DownloadProgressAggregator(
+            completedBytesBeforeTransfers: totalWritten,
+            completedFilesBeforeTransfers: filesCompleted,
+            totalExpectedBytes: totalExpected,
+            fileCount: fileCount
+        )
+        let progressConsumer = Task {
+            var aggregator = aggregator
+            for await update in progressUpdates {
+                guard let progress = aggregator.record(
+                    transferID: update.transferID,
+                    bytesWritten: update.bytesWritten,
+                    serverExpectedBytes: update.serverExpectedBytes,
+                    declaredExpectedBytes: update.declaredExpectedBytes
+                ) else {
+                    continue
+                }
+                self.emitProgress(progress, onProgress: onProgress)
             }
         }
-
-        let completedBytesBeforeTransfers = totalWritten
-        let completedFilesBeforeTransfers = filesCompleted
+        defer {
+            progressContinuation.finish()
+            progressConsumer.cancel()
+        }
 
         // Queue the complete repository up front. If iOS suspends or relaunches
         // the app, URLSession can continue every queued file rather than only
         // the one that happened to be active at that moment.
         await backgroundSession.prepareDownloads(pendingPlans.map { plan in
-            BackgroundModelDownloadSession.PreparedDownload(
+            let transferID = plan.transferID
+            let declaredSize = plan.size
+            return BackgroundModelDownloadSession.PreparedDownload(
                 remoteURL: plan.remoteURL,
                 destinationURL: plan.temporaryURL,
-                transferID: plan.transferID,
-                onProgress: { [weak self] written, expected in
-                    guard let self else { return }
-                    Task { @Sendable in
-                        await self.reportAggregateProgress(
-                            runID: progressRunID,
-                            transferID: plan.transferID,
-                            bytesWritten: written,
-                            serverExpectedBytes: expected,
-                            declaredExpectedBytes: plan.size,
-                            completedBytesBeforeTransfers: completedBytesBeforeTransfers,
-                            completedFilesBeforeTransfers: completedFilesBeforeTransfers,
-                            totalExpectedBytes: totalExpected,
-                            fileCount: fileCount,
-                            onProgress: onProgress
-                        )
-                    }
+                transferID: transferID,
+                onProgress: { written, expected in
+                    progressContinuation.yield(TransferProgress(
+                        transferID: transferID,
+                        bytesWritten: written,
+                        serverExpectedBytes: expected,
+                        declaredExpectedBytes: declaredSize
+                    ))
                 }
             )
         })
@@ -199,7 +258,7 @@ actor ModelDownloader {
                 from: plan.remoteURL,
                 to: plan.temporaryURL,
                 transferID: plan.transferID
-            ) { _, _ in }
+            )
             try Task.checkCancellation()
 
             let actualSize = Self.fileSize(at: plan.temporaryURL) ?? plan.size
@@ -211,10 +270,12 @@ actor ModelDownloader {
                     actual: actualSize
                 )
             }
-            if let expectedSHA256 = plan.sha256,
-               try Self.sha256Hex(of: plan.temporaryURL) != expectedSHA256 {
-                try? FileManager.default.removeItem(at: plan.temporaryURL)
-                throw DownloadError.checksumMismatch(file: plan.name)
+            if let expectedSHA256 = plan.sha256 {
+                guard try await Self.sha256Hex(of: plan.temporaryURL) == expectedSHA256 else {
+                    try? FileManager.default.removeItem(at: plan.temporaryURL)
+                    throw DownloadError.checksumMismatch(file: plan.name)
+                }
+                Self.recordVerifiedChecksum(expectedSHA256, at: plan.temporaryURL)
             }
 
             try? FileManager.default.removeItem(at: plan.destinationURL)
@@ -224,7 +285,7 @@ actor ModelDownloader {
             )
             totalWritten += actualSize
             filesCompleted += 1
-            let progress = computeProgress(
+            let progress = Self.computeProgress(
                 totalWritten: totalWritten,
                 totalExpected: totalExpected,
                 filesCompleted: filesCompleted,
@@ -233,89 +294,60 @@ actor ModelDownloader {
             emitProgress(progress, onProgress: onProgress)
         }
 
-        lastReportedProgress = 1.0
+        // Resume data only matters while a file is incomplete; never move it
+        // into the finished model folder.
+        for plan in plans {
+            try? FileManager.default.removeItem(
+                at: BackgroundModelDownloadSession.resumeDataURL(forDestinationPath: plan.temporaryURL.path)
+            )
+        }
+
+        progressReporter.markComplete()
         onProgress(1.0)
+    }
+
+    // MARK: - Backup Exclusion
+
+    /// Marks `url` (and, for a folder, everything inside it) as excluded from
+    /// iCloud and device backups. Missing items are skipped.
+    nonisolated static func excludeFromBackup(_ url: URL) {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableURL = url
+        do {
+            try mutableURL.setResourceValues(values)
+        } catch {
+            modelDownloadLogger.error(
+                "Could not exclude model files from backup: \(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     // MARK: - Helpers
 
-    /// Throttled, monotonic progress emission. Shared by the per-file completion
-    /// path and the in-flight delegate callbacks.
     private func emitProgress(
         _ progress: Double,
         onProgress: @escaping @Sendable (Double) -> Void
     ) {
-        guard progress - lastReportedProgress >= Self.minProgressInterval else { return }
-        lastReportedProgress = progress
+        guard progressReporter.shouldReport(progress) else { return }
         onProgress(progress)
     }
 
-    private func reportAggregateProgress(
-        runID: UUID,
-        transferID: String,
-        bytesWritten: Int64,
-        serverExpectedBytes: Int64,
-        declaredExpectedBytes: Int64,
-        completedBytesBeforeTransfers: Int64,
-        completedFilesBeforeTransfers: Int,
-        totalExpectedBytes: Int64,
-        fileCount: Int,
-        onProgress: @escaping @Sendable (Double) -> Void
-    ) {
-        guard activeProgressRunID == runID else { return }
-
-        // `totalBytesExpectedToWrite` is `NSURLSessionTransferSizeUnknown` (-1)
-        // when the server omits Content-Length; fall back to the size the
-        // HuggingFace API reported for this file.
-        let expected = serverExpectedBytes > 0
-            ? serverExpectedBytes
-            : declaredExpectedBytes
-        let clamped = expected > 0 ? min(bytesWritten, expected) : bytesWritten
-        transferBytesByID[transferID] = max(0, clamped)
-        if expected > 0 {
-            transferFractionsByID[transferID] = min(
-                Double(max(0, clamped)) / Double(expected),
-                1.0
-            )
-        }
-
-        // Never let an in-flight estimate reach 1.0 -- completion is only
-        // reported once every file has actually been moved into place.
-        let progress: Double
-        if totalExpectedBytes > 0 {
-            let transferredBytes = transferBytesByID.values.reduce(0, +)
-            progress = min(
-                Double(completedBytesBeforeTransfers + transferredBytes)
-                    / Double(totalExpectedBytes),
-                0.999
-            )
-        } else if fileCount > 0 {
-            let transferredFileEquivalents = transferFractionsByID.values.reduce(0, +)
-            progress = min(
-                (Double(completedFilesBeforeTransfers) + transferredFileEquivalents)
-                    / Double(fileCount),
-                0.999
-            )
-        } else {
-            return
-        }
-        emitProgress(progress, onProgress: onProgress)
-    }
-
-    private func reuseCompletedFileIfPossible(
+    private static func reuseCompletedFileIfPossible(
         destination: URL,
         temporary: URL,
         expectedSize: Int64,
         expectedSHA256: String?
-    ) throws -> Bool {
-        if try Self.fileMatches(at: destination, expectedSize: expectedSize, expectedSHA256: expectedSHA256) {
+    ) async throws -> Bool {
+        if try await fileMatches(at: destination, expectedSize: expectedSize, expectedSHA256: expectedSHA256) {
             return true
         }
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
         }
 
-        guard try Self.fileMatches(at: temporary, expectedSize: expectedSize, expectedSHA256: expectedSHA256) else {
+        guard try await fileMatches(at: temporary, expectedSize: expectedSize, expectedSHA256: expectedSHA256) else {
             if FileManager.default.fileExists(atPath: temporary.path) {
                 try FileManager.default.removeItem(at: temporary)
             }
@@ -326,11 +358,14 @@ actor ModelDownloader {
         return true
     }
 
-    private static func fileMatches(
+    /// Checks size, then the checksum. A file verified earlier carries a
+    /// marker tied to its size and modification date, so restarts do not
+    /// re-hash gigabytes of weights.
+    internal static func fileMatches(
         at url: URL,
         expectedSize: Int64,
         expectedSHA256: String?
-    ) throws -> Bool {
+    ) async throws -> Bool {
         guard FileManager.default.fileExists(atPath: url.path),
               let actualSize = fileSize(at: url) else {
             return false
@@ -338,11 +373,18 @@ actor ModelDownloader {
         let sizeMatches = expectedSize > 0 ? actualSize == expectedSize : actualSize > 0
         guard sizeMatches else { return false }
         guard let expectedSHA256 else { return true }
-        return try sha256Hex(of: url) == expectedSHA256
+        if hasVerifiedChecksum(expectedSHA256, at: url) {
+            return true
+        }
+        guard try await sha256Hex(of: url) == expectedSHA256 else { return false }
+        recordVerifiedChecksum(expectedSHA256, at: url)
+        return true
     }
 
     /// Streams the file so multi-gigabyte weights are never held in memory.
-    private static func sha256Hex(of url: URL) throws -> String {
+    /// Runs off the actor so progress updates keep flowing while it hashes.
+    @concurrent
+    nonisolated internal static func sha256Hex(of url: URL) async throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hasher = SHA256()
@@ -357,11 +399,67 @@ actor ModelDownloader {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func fileSize(at url: URL) -> Int64? {
-        (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init)
+    // MARK: - Verified Checksum Marker
+
+    internal static func hasVerifiedChecksum(_ sha256: String, at url: URL) -> Bool {
+        guard let stored = readExtendedAttribute(verifiedChecksumAttribute, at: url),
+              let marker = VerifiedFileMarker(encoded: stored),
+              let current = fileIdentity(at: url) else {
+            return false
+        }
+        return marker.matches(sha256: sha256, size: current.size, modificationTime: current.modificationTime)
     }
 
-    private func computeProgress(
+    internal static func recordVerifiedChecksum(_ sha256: String, at url: URL) {
+        guard let current = fileIdentity(at: url) else { return }
+        let marker = VerifiedFileMarker(
+            sha256: sha256,
+            size: current.size,
+            modificationTime: current.modificationTime
+        )
+        if !writeExtendedAttribute(verifiedChecksumAttribute, value: marker.encoded, at: url) {
+            modelDownloadLogger.debug(
+                "Could not record checksum marker for \(url.lastPathComponent, privacy: .public)"
+            )
+        }
+    }
+
+    /// Reads attributes straight from the file system. `URL.resourceValues`
+    /// can return cached values for a URL that was queried earlier.
+    private static func fileIdentity(at url: URL) -> (size: Int64, modificationTime: Double)? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attributes[.size] as? NSNumber)?.int64Value,
+              let modified = attributes[.modificationDate] as? Date else {
+            return nil
+        }
+        return (size, modified.timeIntervalSinceReferenceDate)
+    }
+
+    private static func readExtendedAttribute(_ name: String, at url: URL) -> String? {
+        url.withUnsafeFileSystemRepresentation { path -> String? in
+            guard let path else { return nil }
+            let length = getxattr(path, name, nil, 0, 0, 0)
+            guard length > 0 else { return nil }
+            var buffer = [UInt8](repeating: 0, count: length)
+            let read = getxattr(path, name, &buffer, length, 0, 0)
+            guard read == length else { return nil }
+            return String(bytes: buffer, encoding: .utf8)
+        }
+    }
+
+    private static func writeExtendedAttribute(_ name: String, value: String, at url: URL) -> Bool {
+        let bytes = Array(value.utf8)
+        return url.withUnsafeFileSystemRepresentation { path -> Bool in
+            guard let path else { return false }
+            return setxattr(path, name, bytes, bytes.count, 0, 0) == 0
+        }
+    }
+
+    private static func fileSize(at url: URL) -> Int64? {
+        fileIdentity(at: url)?.size
+    }
+
+    private static func computeProgress(
         totalWritten: Int64,
         totalExpected: Int64,
         filesCompleted: Int,
@@ -374,6 +472,8 @@ actor ModelDownloader {
         }
         return 0
     }
+
+    // MARK: - Paths
 
     internal static func validatedRemotePathComponents(for remotePath: String) throws -> [String] {
         let trimmed = remotePath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -461,6 +561,7 @@ actor ModelDownloader {
 
     enum DownloadError: LocalizedError {
         case badResponse
+        case metadataHTTPStatus(Int)
         case noFilesFound
         case badURL(file: String)
         case invalidRemotePath(file: String)
@@ -470,6 +571,19 @@ actor ModelDownloader {
         var errorDescription: String? {
             switch self {
             case .badResponse:       return String(localized: "The server returned an unexpected response. Check your internet connection.", bundle: .appLocalized)
+            case .metadataHTTPStatus(let statusCode):
+                switch statusCode {
+                case 401, 403:
+                    return String(localized: "This model requires access on Hugging Face and can't be downloaded.", bundle: .appLocalized)
+                case 404:
+                    return String(localized: "This model version was not found on Hugging Face.", bundle: .appLocalized)
+                case 429:
+                    return String(localized: "Hugging Face is limiting requests right now. Try again in a few minutes.", bundle: .appLocalized)
+                case 500...599:
+                    return String(localized: "Hugging Face is temporarily unavailable (HTTP \(statusCode)). Try again later.", bundle: .appLocalized)
+                default:
+                    return String(localized: "Hugging Face returned an unexpected response (HTTP \(statusCode)).", bundle: .appLocalized)
+                }
             case .noFilesFound:      return String(localized: "No files found for this model on HuggingFace.", bundle: .appLocalized)
             case .badURL(let file):  return String(localized: "Could not construct download URL for file: \(file)", bundle: .appLocalized)
             case .invalidRemotePath(let file):
@@ -480,5 +594,120 @@ actor ModelDownloader {
                 return String(localized: "Downloaded file '\(file)' failed its integrity check. Try downloading the model again.", bundle: .appLocalized)
             }
         }
+    }
+}
+
+// MARK: - Progress Aggregation
+
+/// Combines per-file transfer progress into one overall fraction. Keeps
+/// running totals so each update costs O(1).
+nonisolated struct DownloadProgressAggregator {
+    let completedBytesBeforeTransfers: Int64
+    let completedFilesBeforeTransfers: Int
+    let totalExpectedBytes: Int64
+    let fileCount: Int
+
+    private var bytesByTransfer: [String: Int64] = [:]
+    private var transferredBytes: Int64 = 0
+    private var fractionsByTransfer: [String: Double] = [:]
+    private var transferredFileEquivalents: Double = 0
+
+    init(
+        completedBytesBeforeTransfers: Int64,
+        completedFilesBeforeTransfers: Int,
+        totalExpectedBytes: Int64,
+        fileCount: Int
+    ) {
+        self.completedBytesBeforeTransfers = completedBytesBeforeTransfers
+        self.completedFilesBeforeTransfers = completedFilesBeforeTransfers
+        self.totalExpectedBytes = totalExpectedBytes
+        self.fileCount = fileCount
+    }
+
+    /// Returns the overall progress, which stays below 1.0: completion is
+    /// only reported once every file has been verified and moved into place.
+    mutating func record(
+        transferID: String,
+        bytesWritten: Int64,
+        serverExpectedBytes: Int64,
+        declaredExpectedBytes: Int64
+    ) -> Double? {
+        // `totalBytesExpectedToWrite` is `NSURLSessionTransferSizeUnknown` (-1)
+        // when the server omits Content-Length; fall back to the size the
+        // HuggingFace API reported for this file.
+        let expected = serverExpectedBytes > 0 ? serverExpectedBytes : declaredExpectedBytes
+        let clamped = max(0, expected > 0 ? min(bytesWritten, expected) : bytesWritten)
+
+        transferredBytes += clamped - (bytesByTransfer[transferID] ?? 0)
+        bytesByTransfer[transferID] = clamped
+        if expected > 0 {
+            let fraction = min(Double(clamped) / Double(expected), 1.0)
+            transferredFileEquivalents += fraction - (fractionsByTransfer[transferID] ?? 0)
+            fractionsByTransfer[transferID] = fraction
+        }
+
+        if totalExpectedBytes > 0 {
+            return min(
+                Double(completedBytesBeforeTransfers + transferredBytes) / Double(totalExpectedBytes),
+                0.999
+            )
+        } else if fileCount > 0 {
+            return min(
+                (Double(completedFilesBeforeTransfers) + transferredFileEquivalents) / Double(fileCount),
+                0.999
+            )
+        }
+        return nil
+    }
+}
+
+/// Throttled, monotonic progress emission: at most one report per 1% change.
+nonisolated struct DownloadProgressReporter {
+    static let minimumStep = 0.01
+
+    private(set) var lastReported: Double = -1
+
+    mutating func shouldReport(_ progress: Double) -> Bool {
+        guard progress - lastReported >= Self.minimumStep else { return false }
+        lastReported = progress
+        return true
+    }
+
+    mutating func markComplete() {
+        lastReported = 1.0
+    }
+}
+
+// MARK: - Verified File Marker
+
+/// Records that a file's SHA-256 was checked, tied to the size and
+/// modification time it had then. Any later change invalidates it.
+nonisolated struct VerifiedFileMarker: Equatable {
+    let sha256: String
+    let size: Int64
+    let modificationTime: Double
+
+    init(sha256: String, size: Int64, modificationTime: Double) {
+        self.sha256 = sha256.lowercased()
+        self.size = size
+        self.modificationTime = modificationTime
+    }
+
+    init?(encoded: String) {
+        let parts = encoded.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count == 4, parts[0] == "v1",
+              let size = Int64(parts[2]),
+              let modificationTime = Double(parts[3]) else {
+            return nil
+        }
+        self.init(sha256: String(parts[1]), size: size, modificationTime: modificationTime)
+    }
+
+    var encoded: String {
+        "v1|\(sha256)|\(size)|\(modificationTime)"
+    }
+
+    func matches(sha256 expected: String, size currentSize: Int64, modificationTime currentTime: Double) -> Bool {
+        sha256 == expected.lowercased() && size == currentSize && modificationTime == currentTime
     }
 }

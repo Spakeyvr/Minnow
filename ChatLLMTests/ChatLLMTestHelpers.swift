@@ -20,6 +20,7 @@ internal enum StaleTavilyValidationError: Error {
 
 internal actor TavilyValidationGate {
     private var startedKeys: Set<String> = []
+    private var finishedKeys: Set<String> = []
     private var continuations: [String: CheckedContinuation<Void, Never>] = [:]
 
     func suspend(_ key: String) async {
@@ -27,16 +28,33 @@ internal actor TavilyValidationGate {
         await withCheckedContinuation { continuation in
             continuations[key] = continuation
         }
+        finishedKeys.insert(key)
     }
 
+    /// Waits up to five seconds for validation of `key` to reach the gate, and
+    /// records an issue instead of hanging the suite when it never does.
     func waitUntilStarted(_ key: String) async {
-        while !startedKeys.contains(key) {
-            await Task.yield()
-        }
+        await wait(for: key, event: "start") { startedKeys.contains(key) }
+    }
+
+    /// Waits until the validation of `key` has been resumed past the gate.
+    func waitUntilFinished(_ key: String) async {
+        await wait(for: key, event: "finish") { finishedKeys.contains(key) }
     }
 
     func resume(_ key: String) {
         continuations.removeValue(forKey: key)?.resume()
+    }
+
+    private func wait(for key: String, event: String, until isDone: () -> Bool) async {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !isDone() {
+            guard ContinuousClock.now < deadline else {
+                Issue.record("Validation of \(key) did not \(event) within 5 s")
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
     }
 }
 
@@ -104,6 +122,11 @@ internal final class MockTavilyURLProtocol: URLProtocol, @unchecked Sendable {
 
 internal actor CancellationProbe {
     private var cancelled = false
+    private(set) var started = false
+
+    func markStarted() {
+        started = true
+    }
 
     func markCancelled() {
         cancelled = true
@@ -115,7 +138,7 @@ internal actor CancellationProbe {
 }
 
 internal final class FakePathMonitor: PathMonitoring {
-    nonisolated(unsafe) var pathUpdateHandler: ((NetworkPathStatus) -> Void)?
+    nonisolated(unsafe) var pathUpdateHandler: (@Sendable (NetworkPathStatus) -> Void)?
 
     func start(queue: DispatchQueue) {
         _ = queue
@@ -128,12 +151,14 @@ internal final class FakePathMonitor: PathMonitoring {
     }
 }
 
+/// Polls `probe` for up to five seconds, returning as soon as it is cancelled.
 func waitForCancellation(_ probe: CancellationProbe) async -> Bool {
-    for _ in 0..<20 {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    while ContinuousClock.now < deadline {
         if await probe.isCancelled() {
             return true
         }
-        try? await Task.sleep(for: .milliseconds(25))
+        try? await Task.sleep(for: .milliseconds(5))
     }
     return await probe.isCancelled()
 }
@@ -254,8 +279,6 @@ internal final class CapturingFoundationGenerator: LLMGenerator {
 /// and model storage, including tests that construct multiple view models.
 @MainActor
 final class ChatTestEnvironment {
-    // String assertions must be deterministic even after localized UI tests.
-    private let previousInterfaceLanguage = UserDefaults.standard.string(forKey: AppSettingsKeys.appLanguage)
     let suiteName = "ChatLLMTests." + UUID().uuidString
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     let defaults: UserDefaults
@@ -263,15 +286,38 @@ final class ChatTestEnvironment {
         deviceSupportProfile: MLXDeviceSupportProfile(isPhone: true, ramPrecautionsDisabledOverride: false),
         defaults: defaults, documentsDirectory: directory, restoresBackgroundDownloads: false
     ))
+    private var scratchSuiteNames: [String] = []
+    private var sharedImageURLs: [URL] = []
 
     init() {
-        UserDefaults.standard.set("en", forKey: AppSettingsKeys.appLanguage)
+        // String assertions must be deterministic whatever language the simulator's
+        // app was left in. The override never writes the host app's standard defaults.
+        AppLanguage.overrideCurrent(with: .english)
         defaults = UserDefaults(suiteName: suiteName)!
     }
 
+    /// A fresh `UserDefaults` domain that is removed when the test ends.
+    func makeScratchDefaults(_ label: String) throws -> UserDefaults {
+        let suite = "ChatLLMTests." + label.replacingOccurrences(of: "()", with: "") + "." + UUID().uuidString
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        scratchSuiteNames.append(suite)
+        return defaults
+    }
+
+    /// Deletes `urls` when the test ends, even when it fails early. For images
+    /// that have to live in the app's real attachments folder, because the code
+    /// under test resolves attachments there through `ImageStore.shared`.
+    func removeAfterTest(_ urls: [URL]) {
+        sharedImageURLs.append(contentsOf: urls)
+    }
+
     deinit {
-        UserDefaults.standard.set(previousInterfaceLanguage, forKey: AppSettingsKeys.appLanguage)
-        UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+        for suite in [suiteName] + scratchSuiteNames {
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+        }
+        for url in sharedImageURLs {
+            try? FileManager.default.removeItem(at: url)
+        }
         try? FileManager.default.removeItem(at: directory)
     }
 }

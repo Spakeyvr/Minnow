@@ -48,22 +48,16 @@ extension ChatLLMTests {
             Message(role: .user, text: "Say hello", order: 0, conversation: viewModel.conversation, isFinal: true),
             message
         ]
+        // Repaint every chunk, so the test doesn't depend on the throttle's timing.
+        viewModel.streamRepaintInterval = 0
         let generation = Task { await viewModel.streamAssistant(into: message, basedOnHistoryUpTo: 1) }
         defer { continuation.finish(); generation.cancel() }
 
         continuation.yield("**Hi")
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while message.text.isEmpty && ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        try await waitUntil { !message.text.isEmpty }
         #expect(message.text == "**Hi")
-        try await Task.sleep(for: .milliseconds(150))
         continuation.yield("**\n\nOK")
-        let nextDeadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while message.text != "**Hi**\n\nOK" && ContinuousClock.now < nextDeadline {
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        #expect(message.text == "**Hi**\n\nOK")
+        try await waitUntil { message.text == "**Hi**\n\nOK" }
         #expect(!message.isFinal)
         continuation.finish()
         #expect(await generation.value == .succeeded)
@@ -293,10 +287,13 @@ extension ChatLLMTests {
         #expect(MarkdownBlockCache.blocks(for: source) == MarkdownBlockParser.parse(source))
         #expect(MarkdownBlockCache.blocks(for: source) == MarkdownBlockParser.parse(source))
 
+        #expect(MarkdownBlockCache.cachedCount == 1)
+
         for index in 0..<200 {
             _ = MarkdownBlockCache.blocks(for: "Message \(index)")
         }
-        // Still correct after eviction has certainly happened.
+        // Eviction kept the cache at its limit, and results are still correct after it.
+        #expect(MarkdownBlockCache.cachedCount == MarkdownBlockCache.limit)
         #expect(MarkdownBlockCache.blocks(for: source) == MarkdownBlockParser.parse(source))
     }
 

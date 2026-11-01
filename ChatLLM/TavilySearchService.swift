@@ -5,6 +5,7 @@
 //  Created by Nevio on 10/26/25.
 //
 
+import CryptoKit
 import Foundation
 
 struct TavilySearchResult: Decodable, Identifiable, Sendable {
@@ -81,10 +82,23 @@ private struct TavilyAPIErrorResponse: Decodable, Sendable {
         let code: String?
     }
 
+    /// Tavily documents `{"detail": {"error": "..."}}`; older responses used a
+    /// plain string. Each field is optional so one odd shape never hides the rest.
+    private struct NestedDetail: Decodable, Sendable {
+        let error: String?
+        let message: String?
+    }
+
     nonisolated init(from decoder: any Swift.Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        detail = try container.decodeIfPresent(String.self, forKey: .detail)
-        message = try container.decodeIfPresent(String.self, forKey: .message)
+        if let text = try? container.decodeIfPresent(String.self, forKey: .detail) {
+            detail = text
+        } else if let nested = try? container.decodeIfPresent(NestedDetail.self, forKey: .detail) {
+            detail = nested.error ?? nested.message
+        } else {
+            detail = nil
+        }
+        message = try? container.decodeIfPresent(String.self, forKey: .message)
         error = try? container.decodeIfPresent(String.self, forKey: .error)
         nestedError = try? container.decodeIfPresent(NestedError.self, forKey: .error)
     }
@@ -94,6 +108,7 @@ enum TavilySearchError: LocalizedError {
     case invalidQuery
     case invalidAPIKey
     case rateLimited
+    case usageLimitReached
     case networkError(Error)
     case noResults
     case decodingError(Error)
@@ -103,24 +118,61 @@ enum TavilySearchError: LocalizedError {
         case .invalidQuery: String(localized: "Enter a search query under 400 characters.", bundle: .appLocalized)
         case .invalidAPIKey: String(localized: "The Tavily API key is missing or invalid.", bundle: .appLocalized)
         case .rateLimited: String(localized: "Tavily is receiving too many searches right now. Try again in a moment.", bundle: .appLocalized)
+        case .usageLimitReached: String(localized: "Your Tavily plan has run out of search credits. Check your plan on tavily.com.", bundle: .appLocalized)
         case .networkError(let error): String(localized: "Web search failed: \(error.localizedDescription)", bundle: .appLocalized)
         case .noResults: String(localized: "No relevant web results were found.", bundle: .appLocalized)
         case .decodingError: String(localized: "Tavily returned a response ChatLLM could not read.", bundle: .appLocalized)
         }
     }
+
+    nonisolated static func isCancellation(_ error: any Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
+    }
 }
 
-actor TavilySearchService: WebSearchProviding {
-    private struct CacheEntry {
+/// Search results shared by every `TavilySearchService` that uses the same
+/// API key, so recreating the service (new chat, key notification) keeps them.
+actor TavilySearchResultCache {
+    static let shared = TavilySearchResultCache()
+
+    private struct Entry {
         let value: WebSearchResponse
         let storedAt: Date
         let lifetime: TimeInterval
     }
 
-    nonisolated private static let cacheCapacity = 32
+    private let capacity: Int
+    private var entries: [String: Entry] = [:]
+
+    init(capacity: Int = 32) {
+        self.capacity = max(capacity, 1)
+    }
+
+    func value(for key: String, now: Date = Date()) -> WebSearchResponse? {
+        guard let entry = entries[key] else { return nil }
+        guard now.timeIntervalSince(entry.storedAt) <= entry.lifetime else {
+            entries.removeValue(forKey: key)
+            return nil
+        }
+        return entry.value
+    }
+
+    func store(_ value: WebSearchResponse, for key: String, lifetime: TimeInterval, now: Date = Date()) {
+        if entries[key] == nil, entries.count >= capacity,
+           let oldest = entries.min(by: { $0.value.storedAt < $1.value.storedAt })?.key {
+            entries.removeValue(forKey: oldest)
+        }
+        entries[key] = Entry(value: value, storedAt: now, lifetime: lifetime)
+    }
+}
+
+actor TavilySearchService: WebSearchProviding {
+    nonisolated static let maximumQueryLength = 400
     nonisolated private static let liveCacheTTL: TimeInterval = 60
     nonisolated private static let standardCacheTTL: TimeInterval = 600
     nonisolated private static let retryableStatusCodes: Set<Int> = [429, 500, 502, 503, 504]
+    /// 432: plan limit exceeded; 433: pay-as-you-go limit exceeded.
+    nonisolated private static let usageLimitStatusCodes: Set<Int> = [432, 433]
     // Keep search + retry inside ChatViewModel's 60 s web-search stream timeout.
     nonisolated private static let maximumRetryAfterSeconds: Double = 10
 
@@ -128,25 +180,34 @@ actor TavilySearchService: WebSearchProviding {
     private let baseURL = URL(string: "https://api.tavily.com/search")!
     private let usageURL = URL(string: "https://api.tavily.com/usage")!
     private let session: URLSession
-    private var cache: [String: CacheEntry] = [:]
+    private let cache: TavilySearchResultCache
+    /// Scopes shared cache entries to this key without keeping the key text in them.
+    private let cacheNamespace: String
 
-    init(apiKey: String, session: URLSession = .shared) throws {
+    /// Services on the shared URLSession share one result cache. A custom
+    /// session (tests, mocks) gets a private cache unless one is passed in.
+    init(apiKey: String, session: URLSession = .shared, cache: TavilySearchResultCache? = nil) throws {
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty else { throw TavilySearchError.invalidAPIKey }
         self.apiKey = trimmedKey
         self.session = session
+        self.cache = cache ?? (session === URLSession.shared ? .shared : TavilySearchResultCache())
+        self.cacheNamespace = SHA256.hash(data: Data(trimmedKey.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     func search(query: String, maxResults: Int = 4, searchDepth: String? = nil) async throws -> WebSearchResponse {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedQuery.isEmpty, trimmedQuery.count <= 400 else {
+        guard !trimmedQuery.isEmpty, trimmedQuery.count <= Self.maximumQueryLength else {
             throw TavilySearchError.invalidQuery
         }
 
         let resultLimit = min(max(maxResults, 1), 5)
         let resolvedDepth = Self.validSearchDepth(searchDepth)
-        let cacheKey = Self.makeCacheKey(query: trimmedQuery, maxResults: resultLimit, searchDepth: resolvedDepth)
-        if let cached = cachedResult(for: cacheKey) { return cached }
+        let cacheKey = cacheNamespace + "|" + Self.makeCacheKey(query: trimmedQuery, maxResults: resultLimit, searchDepth: resolvedDepth)
+        if let cached = await cache.value(for: cacheKey) { return cached }
 
         var request = URLRequest(url: baseURL, timeoutInterval: 15)
         request.httpMethod = "POST"
@@ -186,7 +247,11 @@ actor TavilySearchService: WebSearchProviding {
             requestID: decoded.requestID,
             creditsUsed: decoded.creditsUsed
         )
-        storeResult(result, for: cacheKey, query: trimmedQuery)
+        await cache.store(
+            result,
+            for: cacheKey,
+            lifetime: Self.isLiveQuery(trimmedQuery) ? Self.liveCacheTTL : Self.standardCacheTTL
+        )
         return result
     }
 
@@ -212,10 +277,12 @@ actor TavilySearchService: WebSearchProviding {
                     continue
                 }
                 return result
-            } catch is CancellationError {
-                throw CancellationError()
             } catch {
-                if attempt < retryCount {
+                // URLSession reports task cancellation as URLError(.cancelled).
+                if Task.isCancelled || TavilySearchError.isCancellation(error) {
+                    throw CancellationError()
+                }
+                if attempt < retryCount, (error as? URLError)?.isTransientConnectivityFailure == true {
                     attempt += 1
                     try await Task.sleep(for: .milliseconds(250 * attempt))
                     continue
@@ -252,33 +319,15 @@ actor TavilySearchService: WebSearchProviding {
             if httpResponse.statusCode == 429 {
                 throw TavilySearchError.rateLimited
             }
+            if Self.usageLimitStatusCodes.contains(httpResponse.statusCode) {
+                throw TavilySearchError.usageLimitReached
+            }
             let message = parseErrorMessage(from: data)
                 ?? String(localized: "Tavily returned status \(httpResponse.statusCode).", bundle: .appLocalized)
             throw TavilySearchError.networkError(
                 NSError(domain: "Tavily", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: message])
             )
         }
-    }
-
-    private func cachedResult(for key: String) -> WebSearchResponse? {
-        guard let entry = cache[key] else { return nil }
-        guard Date().timeIntervalSince(entry.storedAt) <= entry.lifetime else {
-            cache.removeValue(forKey: key)
-            return nil
-        }
-        return entry.value
-    }
-
-    private func storeResult(_ value: WebSearchResponse, for key: String, query: String) {
-        if cache.count >= Self.cacheCapacity,
-           let oldest = cache.min(by: { $0.value.storedAt < $1.value.storedAt })?.key {
-            cache.removeValue(forKey: oldest)
-        }
-        cache[key] = CacheEntry(
-            value: value,
-            storedAt: Date(),
-            lifetime: Self.isLiveQuery(query) ? Self.liveCacheTTL : Self.standardCacheTTL
-        )
     }
 
     nonisolated private static func makeSources(from results: [TavilySearchResult], limit: Int) -> [WebSearchSource] {
@@ -328,16 +377,31 @@ actor TavilySearchService: WebSearchProviding {
     }
 
     /// Models often search in the user's language, so this covers every interface language.
+    nonisolated private static let liveQueryWords: Set<String> = [
+        "today", "tonight", "current", "currently", "latest", "live", "breaking",
+        "price", "prices", "score", "scores", "weather", "news",
+        "heute", "aktuell", "aktuelle", "aktuellen", "neueste", "neuesten", "preis", "preise",
+        "kurs", "spielstand", "ergebnis", "ergebnisse", "wetter", "nachrichten", "jetzt",
+        "hoy", "actual", "último", "última", "precio", "precios", "marcador", "resultado",
+        "resultados", "clima", "noticias", "ahora"
+    ]
+    nonisolated private static let liveQueryPhrases: [[String]] = [
+        ["this", "week"], ["right", "now"]
+    ]
+
+    /// Matches whole words only, so "deliver" or "Diskurs" do not count as live.
     nonisolated static func isLiveQuery(_ query: String) -> Bool {
-        let normalized = query.lowercased()
-        return [
-            "today", "tonight", "current", "currently", "latest", "live", "breaking",
-            "price", "score", "weather", "news", "this week", "right now",
-            "heute", "aktuell", "neueste", "preis", "kurs", "spielstand", "ergebnis",
-            "wetter", "nachrichten", "jetzt",
-            "hoy", "actual", "último", "última", "precio", "marcador", "resultado",
-            "clima", "noticias", "ahora"
-        ].contains { normalized.contains($0) }
+        let words = query.lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+        if words.contains(where: liveQueryWords.contains) {
+            return true
+        }
+        return liveQueryPhrases.contains { phrase in
+            words.count >= phrase.count && (0...(words.count - phrase.count)).contains { start in
+                Array(words[start..<(start + phrase.count)]) == phrase
+            }
+        }
     }
 
     private func parseErrorMessage(from data: Data) -> String? {

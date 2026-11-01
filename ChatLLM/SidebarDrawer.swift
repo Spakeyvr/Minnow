@@ -74,7 +74,16 @@ struct SidebarDrawer<Sidebar: View, Content: View>: View {
                     .allowsHitTesting(false)
             }
             .ignoresSafeArea()
-            .shadow(color: .black.opacity(0.18 * progress), radius: 24, x: -4, y: 0)
+            .background {
+                // Cast from a plain shape behind the card, so the shadow never renders the
+                // live chat offscreen, and skipped while the drawer is closed.
+                if progress > 0 {
+                    shape
+                        .fill(Color(uiColor: .systemBackground))
+                        .shadow(color: .black.opacity(0.18 * progress), radius: 24, x: -4, y: 0)
+                        .ignoresSafeArea()
+                }
+            }
             .gesture(
                 DrawerPanGesture(
                     isOpen: isOpen,
@@ -136,7 +145,11 @@ private struct DrawerPanGesture: UIGestureRecognizerRepresentable {
     func handleUIGestureRecognizerAction(_ recognizer: DirectionalPanGestureRecognizer, context: Context) {
         let translation = recognizer.translation(in: recognizer.view).x
         switch recognizer.state {
-        case .began, .changed:
+        case .began:
+            // The drag will likely snap the drawer, which plays a selection haptic.
+            AppHaptics.prepareSelectionFeedback()
+            onChanged(translation)
+        case .changed:
             onChanged(translation)
         case .ended, .cancelled, .failed:
             onEnded(translation, recognizer.velocity(in: recognizer.view).x)
@@ -153,9 +166,33 @@ final class DirectionalPanGestureRecognizer: UIPanGestureRecognizer {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesBegan(touches, with: event)
+        // A rightward swipe on a code block or table scrolled away from its leading edge
+        // scrolls it back; opening the drawer there would take that swipe away.
+        if allowsRightward,
+           Self.touchedViewCanScrollTowardLeadingEdge(touches.first?.view, within: view) {
+            state = .failed
+            return
+        }
         if startLocation == nil {
             startLocation = touches.first?.location(in: view)
         }
+    }
+
+    /// True when a horizontally scrollable view between the touched view and the
+    /// recognizer's view has content hidden past its leading edge.
+    static func touchedViewCanScrollTowardLeadingEdge(_ touchedView: UIView?, within container: UIView?) -> Bool {
+        var candidate = touchedView
+        while let current = candidate, current !== container {
+            if let scrollView = current as? UIScrollView,
+               scrollView.isScrollEnabled,
+               scrollView.contentSize.width + scrollView.adjustedContentInset.left + scrollView.adjustedContentInset.right
+                > scrollView.bounds.width,
+               scrollView.contentOffset.x > -scrollView.adjustedContentInset.left + 0.5 {
+                return true
+            }
+            candidate = current.superview
+        }
+        return false
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {

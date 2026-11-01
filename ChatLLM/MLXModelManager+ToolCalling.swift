@@ -12,12 +12,12 @@ import OSLog
 extension MLXModelManager {
     // MARK: - Tool Calling
 
-    enum ToolTemplateSupport: Equatable {
+    nonisolated enum ToolTemplateSupport: Equatable, Sendable {
         case supported
         case unsupported(String)
     }
 
-    struct ToolTemplateInspection {
+    nonisolated struct ToolTemplateInspection: Sendable {
         let support: ToolTemplateSupport
         let preferredToolCallFormat: ToolCallFormat?
         let usesWrappedXMLToolCalls: Bool
@@ -56,7 +56,7 @@ extension MLXModelManager {
     }
 
     nonisolated internal static func prefersUserWrappedToolResponses(for model: MLXModelInfo) -> Bool {
-        model.id.hasPrefix("qwen3.5-")
+        model.family.prefersUserWrappedToolResponses
     }
 
     /// LFM2.5's template prepends BOS and re-emits the "List of tools" system
@@ -64,7 +64,7 @@ extension MLXModelManager {
     /// tool turn injects both mid-conversation. Rebuilding from explicit history
     /// renders each tool round exactly as the model was trained on.
     nonisolated internal static func usesLFMToolTurns(for model: MLXModelInfo) -> Bool {
-        model.id.hasPrefix("lfm2.5-")
+        model.family.usesLFMToolTurns
     }
 
     nonisolated internal static func requiresExplicitMessageHistoryForToolLoop(for model: MLXModelInfo) -> Bool {
@@ -127,7 +127,7 @@ extension MLXModelManager {
         to loaded: ModelContainer,
         for model: MLXModelInfo
     ) async {
-        guard let preferredToolCallFormat = preferredToolCallFormat(for: model) else {
+        guard let preferredToolCallFormat = await toolTemplateInspection(for: model).preferredToolCallFormat else {
             return
         }
 
@@ -147,8 +147,8 @@ extension MLXModelManager {
         )
     }
 
-    func validateToolTemplateSupport(for model: MLXModelInfo) throws {
-        switch toolTemplateSupport(for: model) {
+    func validateToolTemplateSupport(for model: MLXModelInfo) async throws {
+        switch await toolTemplateInspection(for: model).support {
         case .supported:
             return
         case .unsupported(let message):
@@ -156,8 +156,8 @@ extension MLXModelManager {
         }
     }
 
-    func logToolTemplateSupport(for model: MLXModelInfo) {
-        let inspection = toolTemplateInspection(for: model)
+    func logToolTemplateSupport(for model: MLXModelInfo) async {
+        let inspection = await toolTemplateInspection(for: model)
         switch inspection.support {
         case .supported:
             logger.notice("MLX tool template support confirmed for \(model.displayName, privacy: .public)")
@@ -171,90 +171,129 @@ extension MLXModelManager {
         }
     }
 
-    private func toolTemplateSupport(for model: MLXModelInfo) -> ToolTemplateSupport {
-        toolTemplateInspection(for: model).support
+    func usesWrappedXMLToolCalls(for model: MLXModelInfo) async -> Bool {
+        await toolTemplateInspection(for: model).usesWrappedXMLToolCalls
     }
 
-    private func preferredToolCallFormat(for model: MLXModelInfo) -> ToolCallFormat? {
-        toolTemplateInspection(for: model).preferredToolCallFormat
-    }
-
-    func usesWrappedXMLToolCalls(for model: MLXModelInfo) -> Bool {
-        toolTemplateInspection(for: model).usesWrappedXMLToolCalls
-    }
-
-    private func toolTemplateInspection(for model: MLXModelInfo) -> ToolTemplateInspection {
+    /// Cached per model until its files change. The files are read off the
+    /// main actor.
+    func toolTemplateInspection(for model: MLXModelInfo) async -> ToolTemplateInspection {
         if let cached = toolTemplateInspectionCache[model.id] {
             return cached
         }
 
-        guard let modelURL = modelDirectoryURL(for: model) else {
-            let inspection = ToolTemplateInspection(
+        let inspection: ToolTemplateInspection
+        if let modelURL = modelDirectoryURL(for: model) {
+            inspection = await Self.inspectToolTemplateInBackground(
+                modelDirectory: modelURL,
+                modelType: packageMetadata(for: model)?.modelType,
+                localDirName: model.localDirName
+            )
+        } else {
+            inspection = ToolTemplateInspection(
                 support: .unsupported(
                     "Installed model '\(model.localDirName)' could not be inspected for tool support. Re-download the model package to restore the tokenizer chat template."
                 ),
                 preferredToolCallFormat: nil,
                 usesWrappedXMLToolCalls: false
             )
-            toolTemplateInspectionCache[model.id] = inspection
-            return inspection
         }
+        toolTemplateInspectionCache[model.id] = inspection
+        return inspection
+    }
 
-        let candidateFiles = [
-            "tokenizer_config.json",
-            "tokenizer.json",
-            "chat_template.jinja",
-            "chat_template.json",
-            "processor_config.json",
-            "preprocessor_config.json"
-        ]
+    @concurrent
+    nonisolated private static func inspectToolTemplateInBackground(
+        modelDirectory: URL,
+        modelType: String?,
+        localDirName: String
+    ) async -> ToolTemplateInspection {
+        inspectToolTemplate(
+            chatTemplate: chatTemplateText(inModelDirectory: modelDirectory),
+            modelType: modelType,
+            localDirName: localDirName
+        )
+    }
 
-        let combinedContents = candidateFiles.compactMap { fileName -> String? in
-            let url = modelURL.appendingPathComponent(fileName)
-            guard FileManager.default.fileExists(atPath: url.path),
-                  let data = try? Data(contentsOf: url),
-                  let text = String(data: data, encoding: .utf8) else {
-                return nil
-            }
-            return text
-        }.joined(separator: "\n")
-
-        let lowered = combinedContents.lowercased()
+    /// Judges tool support from the chat template alone. The tokenizer
+    /// vocabulary is left out: it is several megabytes for Qwen 3.5 and
+    /// contains strings like "tool_call" for practically any model, which
+    /// made every package look tool-aware.
+    nonisolated internal static func inspectToolTemplate(
+        chatTemplate: String,
+        modelType: String?,
+        localDirName: String
+    ) -> ToolTemplateInspection {
+        let lowered = chatTemplate.lowercased()
         let hasToolsContext = lowered.contains("tools")
         let hasToolRole = lowered.contains("\"tool\"") ||
             lowered.contains("'tool'") ||
             lowered.contains("role == 'tool'") ||
             lowered.contains("role != 'tool'")
         let hasToolCalls = lowered.contains("tool_call") || lowered.contains("tool_calls")
-        let preferredToolCallFormat = Self.inferToolCallFormat(
-            packageContents: combinedContents,
-            modelType: packageMetadata(for: model)?.modelType
-        )
-        let usesWrappedXMLToolCalls = Self.usesWrappedXMLToolCallTemplate(packageContents: combinedContents)
 
         let support: ToolTemplateSupport
         if hasToolsContext && (hasToolRole || hasToolCalls) {
             support = .supported
         } else {
             support = .unsupported(
-                "Installed model '\(model.localDirName)' does not expose a tool-aware chat template. Re-download or update this MLX model package to enable MLX tool calling."
+                "Installed model '\(localDirName)' does not expose a tool-aware chat template. Re-download or update this MLX model package to enable MLX tool calling."
             )
         }
 
-        let inspection = ToolTemplateInspection(
+        return ToolTemplateInspection(
             support: support,
-            preferredToolCallFormat: preferredToolCallFormat,
-            usesWrappedXMLToolCalls: usesWrappedXMLToolCalls
+            preferredToolCallFormat: inferToolCallFormat(loweredTemplate: lowered, modelType: modelType),
+            usesWrappedXMLToolCalls: usesWrappedXMLToolCallTemplate(loweredTemplate: lowered)
         )
-        toolTemplateInspectionCache[model.id] = inspection
-        return inspection
     }
+
+    /// The chat template text of a package: `chat_template.jinja`, plus the
+    /// `chat_template` field of `tokenizer_config.json`, `chat_template.json`,
+    /// and the processor configs (string or named-template list).
+    nonisolated internal static func chatTemplateText(inModelDirectory modelURL: URL) -> String {
+        var templates: [String] = []
+        let jinjaURL = modelURL.appendingPathComponent("chat_template.jinja")
+        if let data = try? Data(contentsOf: jinjaURL), let text = String(data: data, encoding: .utf8) {
+            templates.append(text)
+        }
+        for fileName in [
+            "tokenizer_config.json",
+            "chat_template.json",
+            "processor_config.json",
+            "preprocessor_config.json"
+        ] {
+            let url = modelURL.appendingPathComponent(fileName)
+            guard let data = try? Data(contentsOf: url),
+                  let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                continue
+            }
+            templates.append(contentsOf: chatTemplates(in: json["chat_template"]))
+        }
+        return templates.joined(separator: "\n")
+    }
+
+    nonisolated private static func chatTemplates(in value: Any?) -> [String] {
+        if let template = value as? String {
+            return [template]
+        }
+        if let named = value as? [[String: Any]] {
+            return named.compactMap { $0["template"] as? String }
+        }
+        return []
+    }
+
     nonisolated internal static func inferToolCallFormat(
         packageContents: String,
         modelType: String?
     ) -> ToolCallFormat? {
-        let lowered = packageContents.lowercased()
+        inferToolCallFormat(loweredTemplate: packageContents.lowercased(), modelType: modelType)
+    }
 
+    nonisolated private static func inferToolCallFormat(
+        loweredTemplate lowered: String,
+        modelType: String?
+    ) -> ToolCallFormat? {
         if lowered.contains("<|tool_call_start|>") && lowered.contains("<|tool_call_end|>") {
             return .lfm2
         }
@@ -282,8 +321,11 @@ extension MLXModelManager {
     }
 
     nonisolated internal static func usesWrappedXMLToolCallTemplate(packageContents: String) -> Bool {
-        let lowered = packageContents.lowercased()
-        return lowered.contains("<tool_call>") &&
+        usesWrappedXMLToolCallTemplate(loweredTemplate: packageContents.lowercased())
+    }
+
+    nonisolated private static func usesWrappedXMLToolCallTemplate(loweredTemplate lowered: String) -> Bool {
+        lowered.contains("<tool_call>") &&
             lowered.contains("<function=") &&
             lowered.contains("<parameter=")
     }

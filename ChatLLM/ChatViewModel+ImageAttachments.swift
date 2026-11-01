@@ -13,6 +13,12 @@ import OSLog
 
 extension ChatViewModel {
 
+    /// The message sent for an image without a question. It is shown as the user's
+    /// message, so it follows the app language.
+    static var defaultImagePrompt: String {
+        String(localized: "Describe what you see", bundle: .appLocalized)
+    }
+
     /// Send a user message with an image attachment.
     func sendWithImage(
         text: String,
@@ -20,13 +26,29 @@ extension ChatViewModel {
         regenerateTitle: Bool = false,
         editedUserMessageID: UUID? = nil
     ) async {
+        _ = await trySendWithImage(
+            text: text,
+            image: image,
+            regenerateTitle: regenerateTitle,
+            editedUserMessageID: editedUserMessageID
+        )
+    }
+
+    /// `sendWithImage`, returning false when the message was not sent (see `trySend`),
+    /// so the caller can give the text and image back.
+    func trySendWithImage(
+        text: String,
+        image: UIImage,
+        regenerateTitle: Bool = false,
+        editedUserMessageID: UUID? = nil
+    ) async -> Bool {
         logger.debug("sendWithImage called")
 
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let userPrompt = trimmed.isEmpty ? "What do you see in this image?" : trimmed
+        let userPrompt = trimmed.isEmpty ? Self.defaultImagePrompt : trimmed
 
-        guard !isRegenerating else { return }
-        await runGeneration { generationID in
+        guard beginUserTurn() else { return false }
+        return await runTurn { generationID in
             await self.sendImageTurn(
                 userPrompt: userPrompt,
                 image: image,
@@ -44,10 +66,7 @@ extension ChatViewModel {
         regenerateTitle: Bool,
         editedUserMessageID: UUID?
     ) async {
-        let shouldUseReasoning = await resolvedReasoningMode(
-            for: userPrompt,
-            logContext: "image query"
-        )
+        let shouldUseReasoning = resolvedReasoningMode(for: userPrompt)
 
         guard isGenerationActive(generationID) else { return }
 
@@ -61,20 +80,24 @@ extension ChatViewModel {
         // message's old one rather than joining it.
         let replacedAttachments = editedUserMessageID == nil ? [] : turn.message.attachments
 
+        // The placeholder below saves the attachment change together with the turn.
         let isAttached: Bool
         do {
-            try await addImageAttachment(image, to: turn.message)
+            try await addImageAttachment(image, to: turn.message, savesImmediately: false)
             removeAttachments(replacedAttachments, from: turn.message)
             isAttached = true
         } catch {
             logger.error("Failed to attach image: \((error as NSError).localizedDescription, privacy: .public)")
             isAttached = false
         }
-        guard isGenerationActive(generationID) else { return }
+        guard isGenerationActive(generationID) else {
+            // Keep what the edit already changed rather than leaving it unsaved.
+            immediateSave()
+            return
+        }
         let assistantMsg = appendAssistantPlaceholder(isReasoningMode: shouldUseReasoning)
 
         if isAttached {
-            guard isGenerationActive(generationID) else { return }
             _ = await streamAssistant(
                 into: assistantMsg,
                 basedOnHistoryUpTo: assistantMsg.order,
@@ -95,12 +118,12 @@ extension ChatViewModel {
         }
 
         guard isGenerationActive(generationID) else { return }
-        await finishAutoNamingIfNeeded(turn.needsAutoNaming)
+        scheduleAutoNamingIfNeeded(turn.needsAutoNaming)
     }
 
     // MARK: - Private Helpers
 
-    /// The files are left to the app's orphaned-attachment cleanup.
+    /// The files are left to the app's orphaned-attachment cleanup. The caller saves.
     private func removeAttachments(_ attachments: [MessageAttachment], from message: Message) {
         guard !attachments.isEmpty else { return }
         let ids = Set(attachments.map(\.id))
@@ -108,14 +131,15 @@ extension ChatViewModel {
         for attachment in attachments {
             context.delete(attachment)
         }
-        immediateSave()
     }
-    
-    /// Add image attachment (basic version)
+
+    /// Add image attachment (basic version). `savesImmediately: false` leaves the save to
+    /// the caller when it saves the rest of the turn right after.
     @discardableResult
     func addImageAttachment(
         _ image: UIImage,
-        to message: Message
+        to message: Message,
+        savesImmediately: Bool = true
     ) async throws -> MessageAttachment {
         // Save image to disk
         let fileURL = try await ImageStore.shared.save(image: image)
@@ -132,8 +156,10 @@ extension ChatViewModel {
         attachment.message = message
         
         conversation.lastUpdated = Date()
-        immediateSave()
-        
+        if savesImmediately {
+            immediateSave()
+        }
+
         return attachment
     }
 }

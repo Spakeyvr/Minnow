@@ -21,6 +21,7 @@ extension ChatLLMTests {
         let stream: AsyncThrowingStream<String, Error> = TaskBackedAsyncThrowingStream.make { continuation in
             Task {
                 do {
+                    await probe.markStarted()
                     try await Task.sleep(for: .seconds(30))
                     continuation.finish()
                 } catch is CancellationError {
@@ -37,7 +38,9 @@ extension ChatLLMTests {
             _ = try? await iterator.next()
         }
 
-        try? await Task.sleep(for: .milliseconds(50))
+        // Cancel only once the producer is running, so the test covers stopping
+        // work that is already in flight.
+        try? await waitUntilAsync { await probe.started }
         consumer.cancel()
         _ = await consumer.result
 

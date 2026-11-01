@@ -31,7 +31,11 @@ struct OnboardingView: View {
 
     @Environment(\.locale) private var locale
     @State private var step: Step = .intro
-    @State private var tavilyKey: String = TavilyAPIKeyStore.currentKey() ?? ""
+    /// Read from the Keychain once, on appear. A State initial value would repeat the
+    /// Keychain read on every parent render.
+    @State private var tavilyKey: String = ""
+    @State private var hasLoadedTavilyKey = false
+    @State private var tavilyKeySaveFailed = false
     @State private var selectedModelID: String?
 
     private var modelManager: MLXModelManager? { modelBackendBridge.modelManager }
@@ -77,7 +81,16 @@ struct OnboardingView: View {
                 .allowsHitTesting(false)
                 .accessibilityIdentifier("onboarding.root")
         }
+        .alert("Couldn't Save API Key", isPresented: $tavilyKeySaveFailed) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("The Tavily API key couldn't be stored in the Keychain. Try again.")
+        }
         .onAppear {
+            if !hasLoadedTavilyKey {
+                hasLoadedTavilyKey = true
+                tavilyKey = TavilyAPIKeyStore.currentKey() ?? ""
+            }
             if selectedModelID == nil {
                 selectedModelID = modelManager?.availableModels.first?.id
             }
@@ -201,7 +214,8 @@ struct OnboardingView: View {
                 .frame(maxHeight: 300)
 
                 if let selectedModel {
-                    downloadStatus(for: selectedModel, modelManager: modelManager)
+                    // Observes the manager itself: the bridge doesn't forward download progress.
+                    OnboardingDownloadStatusView(model: selectedModel, modelManager: modelManager)
                 }
             } else {
                 LoadingIndicator()
@@ -226,6 +240,7 @@ struct OnboardingView: View {
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selectedModelID == model.id ? .isSelected : [])
         .accessibilityIdentifier("onboarding.mlx.model.\(model.id)")
     }
 
@@ -265,48 +280,24 @@ struct OnboardingView: View {
         }
     }
 
-    @ViewBuilder
-    private func downloadStatus(
-        for model: MLXModelManager.MLXModelInfo,
-        modelManager: MLXModelManager
-    ) -> some View {
-        if let activeDownloadModel = modelManager.activeDownloadModel {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(activeDownloadModel.id == model.id ? "Downloading \(activeDownloadModel.displayName)" : "\(activeDownloadModel.displayName) is downloading")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                ProgressView(value: modelManager.downloadProgress)
-                Text(modelManager.downloadProgress, format: .percent.precision(.fractionLength(0)))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("You can finish onboarding now and keep using the app while this continues.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .accessibilityIdentifier("onboarding.mlx.progress.\(activeDownloadModel.id)")
-        } else if model.isAvailable {
-            Label("MLX model is installed.", systemImage: "checkmark.circle.fill")
-                .font(.subheadline)
-                .foregroundStyle(.green)
-        } else if let issue = modelManager.availabilityIssue(for: model) {
-            Text(issue)
-                .font(.caption)
-                .foregroundStyle(.orange)
-        } else if let error = modelManager.downloadError(for: model.id) {
-            Text(error)
-                .font(.caption)
-                .foregroundStyle(.red)
-        } else {
-            Button {
-                modelManager.startDownload(for: model)
-            } label: {
-                Label("Download \(model.downloadSize(locale: locale))", systemImage: "arrow.down.circle.fill")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(modelManager.hasActiveDownload(excluding: model.id))
-            .accessibilityIdentifier("onboarding.mlx.download")
-        }
+    enum DownloadStatus: Equatable {
+        case downloading
+        case installed
+        case unavailable(String)
+        /// Offers the download, with the last attempt's error when it failed.
+        case download(previousError: String?)
+    }
+
+    static func downloadStatus(
+        hasActiveDownload: Bool,
+        isInstalled: Bool,
+        availabilityIssue: String?,
+        downloadError: String?
+    ) -> DownloadStatus {
+        if hasActiveDownload { return .downloading }
+        if isInstalled { return .installed }
+        if let availabilityIssue { return .unavailable(availabilityIssue) }
+        return .download(previousError: downloadError)
     }
 
     private var footer: some View {
@@ -409,7 +400,7 @@ struct OnboardingView: View {
             step = .tavily
         case .tavily:
             // Trims the key; an empty key clears the stored key.
-            TavilyAPIKeyStore.save(tavilyKey)
+            guard saveTavilyKey() else { return }
             step = .mlx
         case .mlx:
             finishOnboarding()
@@ -420,8 +411,84 @@ struct OnboardingView: View {
         // Skip is always visible, so a key typed on the web search step is kept
         // rather than dropped just because Continue wasn't tapped first.
         if step == .tavily {
-            TavilyAPIKeyStore.save(tavilyKey)
+            guard saveTavilyKey() else { return }
         }
         onFinish()
+    }
+
+    /// Stores the typed key. On failure the user stays on this step and is told, rather
+    /// than leaving onboarding believing web search is set up.
+    private func saveTavilyKey() -> Bool {
+        guard TavilyAPIKeyStore.save(tavilyKey) else {
+            tavilyKeySaveFailed = true
+            return false
+        }
+        return true
+    }
+}
+
+// MARK: - Download Status
+
+/// The selected model's download state. It observes the model manager directly, so
+/// progress updates re-render only this view, not the whole onboarding flow.
+private struct OnboardingDownloadStatusView: View {
+    let model: MLXModelManager.MLXModelInfo
+    @ObservedObject var modelManager: MLXModelManager
+    @Environment(\.locale) private var locale
+
+    var body: some View {
+        let status = OnboardingView.downloadStatus(
+            hasActiveDownload: modelManager.activeDownloadModel != nil,
+            isInstalled: model.isAvailable,
+            availabilityIssue: modelManager.availabilityIssue(for: model),
+            downloadError: modelManager.downloadError(for: model.id)
+        )
+        switch status {
+        case .downloading:
+            if let activeDownloadModel = modelManager.activeDownloadModel {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(activeDownloadModel.id == model.id ? "Downloading \(activeDownloadModel.displayName)" : "\(activeDownloadModel.displayName) is downloading")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    ProgressView(value: modelManager.downloadProgress)
+                    Text(modelManager.downloadProgress, format: .percent.precision(.fractionLength(0)))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("You can finish onboarding now and keep using the app while this continues.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityIdentifier("onboarding.mlx.progress.\(activeDownloadModel.id)")
+            }
+        case .installed:
+            Label("MLX model is installed.", systemImage: "checkmark.circle.fill")
+                .font(.subheadline)
+                .foregroundStyle(.green)
+        case .unavailable(let issue):
+            Text(issue)
+                .font(.caption)
+                .foregroundStyle(.orange)
+        case .download(let previousError):
+            // A failed download keeps its button, so the user can try again right here.
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    modelManager.startDownload(for: model)
+                } label: {
+                    Label("Download \(model.downloadSize(locale: locale))", systemImage: "arrow.down.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(modelManager.hasActiveDownload(excluding: model.id))
+                .accessibilityIdentifier("onboarding.mlx.download")
+
+                if let previousError {
+                    Text(previousError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("onboarding.mlx.downloadError")
+                }
+            }
+        }
     }
 }

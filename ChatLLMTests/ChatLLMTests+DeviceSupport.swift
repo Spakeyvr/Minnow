@@ -16,13 +16,13 @@ import FoundationModels
 @testable import ChatLLM
 
 extension ChatLLMTests {
-    @Test func qwen4BRequiresEightGigabytesOnIPhone() {
+    @Test func qwen4BRequiresEightGigabytesOnIPhone() throws {
         let profile = makeDeviceProfile(
             isPhone: true,
             physicalMemoryBytes: 6 * MLXDeviceSupportProfile.gibibyte
         )
         let manager = makeModelManager(deviceSupportProfile: profile)
-        let model = try! #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
+        let model = try #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
 
         #expect(!profile.supportsModel(model))
         #expect(profile.availabilityIssue(for: model)?.contains("8 GB") == true)
@@ -39,48 +39,48 @@ extension ChatLLMTests {
         #expect(manager.installedModels.map(\.id) == [installedID])
     }
 
-    @Test func qwen4BEnablesToolCallsAtEightGigabytesOnIPhone() {
+    @Test func qwen4BEnablesToolCallsAtEightGigabytesOnIPhone() throws {
         let profile = makeDeviceProfile(
             isPhone: true,
             physicalMemoryBytes: 8 * MLXDeviceSupportProfile.gibibyte
         )
         let manager = makeModelManager(deviceSupportProfile: profile)
-        let model = try! #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
+        let model = try #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
 
         #expect(profile.supportsModel(model))
         #expect(manager.supportsToolCalls(for: model))
         #expect(manager.toolCallIssue(for: model) == nil)
     }
 
-    @Test func qwen2BAllowsSixGigabyteIPhonesButBlocksToolCalls() {
+    @Test func qwen2BAllowsSixGigabyteIPhonesButBlocksToolCalls() throws {
         let profile = makeDeviceProfile(
             isPhone: true,
             physicalMemoryBytes: 6 * MLXDeviceSupportProfile.gibibyte
         )
         let manager = makeModelManager(deviceSupportProfile: profile)
-        let model = try! #require(manager.model(withID: "qwen3.5-2b-4bit"))
+        let model = try #require(manager.model(withID: "qwen3.5-2b-4bit"))
 
         #expect(profile.supportsModel(model))
         #expect(!manager.supportsToolCalls(for: model))
         #expect(manager.toolCallIssue(for: model)?.contains("8 GB") == true)
     }
 
-    @Test func qwen2BEnablesToolCallsAtEightGigabytesOnIPhone() {
+    @Test func qwen2BEnablesToolCallsAtEightGigabytesOnIPhone() throws {
         let profile = makeDeviceProfile(
             isPhone: true,
             physicalMemoryBytes: 8 * MLXDeviceSupportProfile.gibibyte
         )
         let manager = makeModelManager(deviceSupportProfile: profile)
-        let model = try! #require(manager.model(withID: "qwen3.5-2b-4bit"))
+        let model = try #require(manager.model(withID: "qwen3.5-2b-4bit"))
 
         #expect(profile.supportsModel(model))
         #expect(manager.supportsToolCalls(for: model))
         #expect(manager.toolCallIssue(for: model) == nil)
     }
 
-    @Test func lfm25ModelDefinitionMatchesDownloadMetadata() {
+    @Test func lfm25ModelDefinitionMatchesDownloadMetadata() throws {
         let manager = makeModelManager()
-        let model = try! #require(manager.model(withID: "lfm2.5-2.6b-4bit"))
+        let model = try #require(manager.model(withID: "lfm2.5-2.6b-4bit"))
 
         #expect(model.name == "LFM2.5")
         #expect(model.localDirName == "LFM2.5-2.6B-MLX-4bit")
@@ -94,7 +94,7 @@ extension ChatLLMTests {
         #expect(model.requiredProcessorClass == nil)
     }
 
-    @Test func lfm25PhoneMemoryLimitsGateModelAndToolCalls() {
+    @Test func lfm25PhoneMemoryLimitsGateModelAndToolCalls() throws {
         let fourGigabyteProfile = makeDeviceProfile(
             isPhone: true,
             physicalMemoryBytes: 4 * MLXDeviceSupportProfile.gibibyte
@@ -111,9 +111,9 @@ extension ChatLLMTests {
         let fourGigabyteManager = makeModelManager(deviceSupportProfile: fourGigabyteProfile)
         let sixGigabyteManager = makeModelManager(deviceSupportProfile: sixGigabyteProfile)
         let eightGigabyteManager = makeModelManager(deviceSupportProfile: eightGigabyteProfile)
-        let fourGigabyteModel = try! #require(fourGigabyteManager.model(withID: "lfm2.5-2.6b-4bit"))
-        let sixGigabyteModel = try! #require(sixGigabyteManager.model(withID: "lfm2.5-2.6b-4bit"))
-        let eightGigabyteModel = try! #require(eightGigabyteManager.model(withID: "lfm2.5-2.6b-4bit"))
+        let fourGigabyteModel = try #require(fourGigabyteManager.model(withID: "lfm2.5-2.6b-4bit"))
+        let sixGigabyteModel = try #require(sixGigabyteManager.model(withID: "lfm2.5-2.6b-4bit"))
+        let eightGigabyteModel = try #require(eightGigabyteManager.model(withID: "lfm2.5-2.6b-4bit"))
 
         #expect(!fourGigabyteProfile.supportsModel(fourGigabyteModel))
         #expect(fourGigabyteProfile.availabilityIssue(for: fourGigabyteModel)?.contains("6 GB") == true)
@@ -125,15 +125,15 @@ extension ChatLLMTests {
         #expect(eightGigabyteManager.toolCallIssue(for: eightGigabyteModel) == nil)
     }
 
-    @Test func qwenEightGigabyteTierTreatsSlightlyUnderreportedPhoneAsEightGigabytes() {
+    @Test func qwenEightGigabyteTierTreatsSlightlyUnderreportedPhoneAsEightGigabytes() throws {
         let marketedEightGigabytesButReportedBelowEightGiB: UInt64 = 7_950_000_000
         let profile = makeDeviceProfile(
             isPhone: true,
             physicalMemoryBytes: marketedEightGigabytesButReportedBelowEightGiB
         )
         let manager = makeModelManager(deviceSupportProfile: profile)
-        let twoBModel = try! #require(manager.model(withID: "qwen3.5-2b-4bit"))
-        let fourBModel = try! #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
+        let twoBModel = try #require(manager.model(withID: "qwen3.5-2b-4bit"))
+        let fourBModel = try #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
 
         #expect(profile.supportsModel(twoBModel))
         #expect(manager.supportsToolCalls(for: twoBModel))
@@ -209,32 +209,22 @@ extension ChatLLMTests {
     }
 
     @Test func userDefaultsContextWindowClampsToFiveHundredTwelveTokenMinimum() {
+        // The environment's defaults are a fresh domain removed after the test.
         let defaults = testEnvironment.defaults
-        let key = "mlxContextWindowTokens"
-        let hadExistingValue = defaults.object(forKey: key) != nil
-        let previousValue = defaults.integer(forKey: key)
-
-        defaults.set(128, forKey: key)
-        defer {
-            if hadExistingValue {
-                defaults.set(previousValue, forKey: key)
-            } else {
-                defaults.removeObject(forKey: key)
-            }
-        }
+        defaults.set(128, forKey: AppSettingsKeys.mlxContextWindowTokens)
 
         #expect(defaults.mlxContextWindowTokens(deviceMaximum: 1_024) == 512)
         #expect(defaults.mlxContextWindowTokens(deviceMaximum: 2_048) == 512)
         #expect(defaults.mlxContextWindowTokens(deviceMaximum: 6_144) == 512)
     }
 
-    @Test func qwenIPhoneMemoryLimitsDoNotApplyToNonPhoneDevices() {
+    @Test func qwenIPhoneMemoryLimitsDoNotApplyToNonPhoneDevices() throws {
         let profile = makeDeviceProfile(
             isPhone: false,
             physicalMemoryBytes: 6 * MLXDeviceSupportProfile.gibibyte
         )
         let manager = makeModelManager(deviceSupportProfile: profile)
-        let fourBModel = try! #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
+        let fourBModel = try #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
 
         #expect(profile.supportsModel(fourBModel))
         #expect(manager.supportsToolCalls(for: fourBModel))
@@ -264,24 +254,24 @@ extension ChatLLMTests {
         #expect(MLXRuntimeConfiguration.metalGPUArchitecture(for: "Generic Simulator GPU") == nil)
     }
 
-    @Test func phoneContextOverridesDoNotClampNonPhoneDevices() {
+    @Test func phoneContextOverridesDoNotClampNonPhoneDevices() throws {
         let profile = makeDeviceProfile(
             isPhone: false,
             physicalMemoryBytes: 8 * MLXDeviceSupportProfile.gibibyte
         )
         let manager = makeModelManager(deviceSupportProfile: profile)
-        let compactModel = try! #require(manager.model(withID: "qwen3.5-0.8b-4bit"))
+        let compactModel = try #require(manager.model(withID: "qwen3.5-0.8b-4bit"))
 
         #expect(profile.maxContextWindowTokens(for: compactModel) == 2_048)
     }
 
-    @Test func modelManagerRejectsIncompatibleProgrammaticDownloads() {
+    @Test func modelManagerRejectsIncompatibleProgrammaticDownloads() throws {
         let profile = makeDeviceProfile(
             isPhone: true,
             physicalMemoryBytes: 6 * MLXDeviceSupportProfile.gibibyte
         )
         let manager = makeModelManager(deviceSupportProfile: profile)
-        let model = try! #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
+        let model = try #require(manager.model(withID: "qwen3.5-4b-4bit-hybrid"))
 
         manager.startDownload(for: model)
 
@@ -351,10 +341,11 @@ extension ChatLLMTests {
         let modelID = try #require(manager.availableModels.first?.id)
 
         // A chat on Apple Intelligence keeps it; the new model isn't loaded beside it.
+        // The bridge receives completions on the main queue; draining it runs the handler.
         bridge.selectedBackend = .foundationModels
         manager.loadError = nil
         manager.downloadCompleted.send(modelID)
-        try await Task.sleep(for: .milliseconds(100))
+        await drainMainQueue()
         #expect(bridge.selectedBackend == .foundationModels)
         #expect(manager.loadError == nil && !manager.isLoading)
 
@@ -362,7 +353,7 @@ extension ChatLLMTests {
         bridge.selectedBackend = .mlx
         bridge.selectedModelID = "another-model"
         manager.downloadCompleted.send(modelID)
-        try await Task.sleep(for: .milliseconds(100))
+        await drainMainQueue()
         #expect(bridge.selectedModelID == "another-model")
         #expect(manager.loadError == nil && !manager.isLoading)
 
@@ -370,8 +361,7 @@ extension ChatLLMTests {
         // attempt ends in a load error rather than a loaded model.
         bridge.selectedModelID = modelID
         manager.downloadCompleted.send(modelID)
-        try await Task.sleep(for: .milliseconds(100))
-        #expect(manager.loadError != nil)
+        try await waitUntil { manager.loadError != nil }
     }
 
     @Test func deletingTheSelectedModelLeavesNoSelectionThatCannotReply() throws {

@@ -143,7 +143,8 @@ nonisolated enum MarkdownBlockParser {
             if isBlank(line) { break }
 
             // A setext underline only applies when it follows paragraph text.
-            if !collected.isEmpty, let level = setextUnderlineLevel(line) {
+            if !collected.isEmpty, let level = setextUnderlineLevel(line),
+               !isUndecidedSetextUnderline(line, isLastLine: index == lines.count - 1) {
                 index += 1
                 let text = collected.joined(separator: "\n").trimmingCharacters(in: .whitespaces)
                 return [.heading(level: level, text: text)]
@@ -151,12 +152,34 @@ nonisolated enum MarkdownBlockParser {
 
             if !collected.isEmpty, interruptsParagraph(line, depth: depth) { break }
 
+            // GFM lets a table interrupt a paragraph, so "Intro:\n| A |\n|---|"
+            // is a paragraph followed by a table, not one paragraph of pipes.
+            if !collected.isEmpty, startsTable(lines, at: index) { break }
+
             collected.append(line.trimmingTrailingWhitespace())
             index += 1
         }
 
         guard !collected.isEmpty else { return [] }
         return [.paragraph(collected.joined(separator: "\n"))]
+    }
+
+    /// A lone `-` closing the input is still being streamed: it is far more
+    /// often the start of a list item than a level-2 underline, so it stays
+    /// paragraph text until the next token decides it. Otherwise the line above
+    /// would flash as a large heading on every list that follows a paragraph.
+    private static func isUndecidedSetextUnderline(_ line: String, isLastLine: Bool) -> Bool {
+        guard isLastLine else { return false }
+        return line.trimmingCharacters(in: .whitespaces) == "-"
+    }
+
+    /// Whether `lines[index]` is a table header row followed by a matching
+    /// delimiter row.
+    private static func startsTable(_ lines: [String], at index: Int) -> Bool {
+        guard index + 1 < lines.count, lines[index].contains("|"),
+              let alignments = tableDelimiterAlignments(lines[index + 1]) else { return false }
+        let headers = splitTableRow(lines[index])
+        return !headers.isEmpty && headers.count == alignments.count
     }
 
     /// CommonMark lets some constructs interrupt a paragraph without a blank
@@ -175,14 +198,16 @@ nonisolated enum MarkdownBlockParser {
 
     // MARK: Fenced code
 
-    private struct Fence {
+    /// An opening code fence. Shared with `RichTextFeatureDetector` so the math
+    /// detector masks exactly the code this parser renders as code.
+    struct Fence: Equatable {
         let character: Character
         let length: Int
         let indent: Int
         let language: String?
     }
 
-    private static func fenceOpening(_ line: String) -> Fence? {
+    static func fenceOpening(_ line: String) -> Fence? {
         let indent = indentWidth(line)
         guard indent < 4 else { return nil }
         let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
@@ -196,7 +221,7 @@ nonisolated enum MarkdownBlockParser {
         return Fence(character: first, length: run.count, indent: indent, language: language)
     }
 
-    private static func isFenceClosing(_ line: String, fence: Fence) -> Bool {
+    static func isFenceClosing(_ line: String, fence: Fence) -> Bool {
         guard indentWidth(line) < 4 else { return false }
         let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
         guard let first = trimmed.first, first == fence.character else { return false }
@@ -540,9 +565,18 @@ nonisolated enum MarkdownBlockParser {
         guard (1...6).contains(hashes.count) else { return nil }
         let rest = trimmed.dropFirst(hashes.count)
         guard rest.isEmpty || rest.first == " " || rest.first == "\t" else { return nil }
-        // A closing sequence of hashes is decorative and is stripped.
+        // A closing sequence of hashes is decorative and is stripped, but only
+        // when whitespace precedes it (or it is the whole text): "C#" keeps its hash.
         var text = rest.trimmingCharacters(in: .whitespaces)
-        while text.hasSuffix("#") { text.removeLast() }
+        let closingCount = text.reversed().prefix(while: { $0 == "#" }).count
+        if closingCount > 0 {
+            let closingStart = text.index(text.endIndex, offsetBy: -closingCount)
+            if closingStart == text.startIndex {
+                text = ""
+            } else if let preceding = text[..<closingStart].last, preceding == " " || preceding == "\t" {
+                text = String(text[..<closingStart])
+            }
+        }
         return (hashes.count, text.trimmingCharacters(in: .whitespaces))
     }
 

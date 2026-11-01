@@ -45,9 +45,8 @@ extension ChatLLMTests {
     // MARK: - Image store
 
     @Test func imageStoreSavesAReadableDownscaledImage() async throws {
-        let store = ImageStore.shared
+        let store = makeImageStore()
         let url = try await store.save(image: makeTestImage(width: 2_000, height: 1_000), maxDimension: 200)
-        defer { Task { try? await store.delete(url: url) } }
 
         let metrics = await store.imageMetrics(at: url)
         let unwrapped = try #require(metrics)
@@ -59,9 +58,8 @@ extension ChatLLMTests {
     @Test func recentlySavedImagesSurviveOrphanCleanup() async throws {
         // A just-attached image is not yet referenced by a saved message. The
         // protection window is what stops cleanup from deleting it underneath.
-        let store = ImageStore.shared
+        let store = makeImageStore()
         let url = try await store.save(image: makeTestImage(width: 60, height: 40), maxDimension: 60)
-        defer { Task { try? await store.delete(url: url) } }
 
         try await store.cleanupOrphanedFiles(referencedURLs: [])
 
@@ -71,9 +69,8 @@ extension ChatLLMTests {
     @Test func referencedImagesSurviveCleanupWhenPathsAreSpelledDifferently() async throws {
         // On device the directory listing and the stored reference can name the
         // same container through /private/var and /var; that must not orphan the file.
-        let store = ImageStore.shared
+        let store = makeImageStore()
         let url = try await store.save(image: makeTestImage(width: 60, height: 40), maxDimension: 60)
-        defer { Task { try? await store.delete(url: url) } }
         let old = Date().addingTimeInterval(-3_600)
         try FileManager.default.setAttributes([.creationDate: old, .modificationDate: old], ofItemAtPath: url.path)
 
@@ -84,7 +81,7 @@ extension ChatLLMTests {
     }
 
     @Test func imageStoreRejectsDegenerateImages() async {
-        let store = ImageStore.shared
+        let store = makeImageStore()
         await #expect(throws: (any Error).self) {
             _ = try await store.save(image: UIImage())
         }

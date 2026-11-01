@@ -46,14 +46,20 @@ extension ChatLLMTests {
     }
 
     // MARK: - Test helpers
-    /// A persisted conversation seeded with finished turns, for editing tests.
-    func makeChat(_ turns: [(MessageRole, String)]) throws -> ChatViewModel {
+    /// A context over a fresh in-memory store with the app's full schema. The
+    /// context keeps its container alive, so tests reach it through `context.container`.
+    func makeContext() throws -> SwiftData.ModelContext {
         let schema = Schema([Conversation.self, ChatLLM.Message.self, MessageAttachment.self])
         let container = try ModelContainer(
             for: schema,
             configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
         )
-        let context = ModelContext(container)
+        return ModelContext(container)
+    }
+
+    /// A persisted conversation seeded with finished turns, for editing tests.
+    func makeChat(_ turns: [(MessageRole, String)]) throws -> ChatViewModel {
+        let context = try makeContext()
         let conversation = Conversation(title: "Test")
         context.insert(conversation)
         conversation.messages = turns.enumerated().map { index, turn in
@@ -71,12 +77,16 @@ extension ChatLLMTests {
 
 
     /// An isolated `UserDefaults` domain so settings tests never touch the
-    /// simulator's real preferences or each other's.
+    /// simulator's real preferences or each other's. The test environment
+    /// removes the domain when the test ends.
     func makeScratchDefaults(_ label: String) throws -> UserDefaults {
-        let suite = "ChatLLMTests." + label.replacingOccurrences(of: "()", with: "")
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        try testEnvironment.makeScratchDefaults(label)
+    }
+
+    /// An image store rooted in the test's temporary directory, which the test
+    /// environment deletes, so store tests never touch the app's real attachments.
+    func makeImageStore() -> ImageStore {
+        ImageStore(attachmentsDirectory: testEnvironment.directory.appending(path: "Attachments", directoryHint: .isDirectory))
     }
 
     /// Polls `condition` for up to five seconds and records an issue if it
@@ -87,6 +97,24 @@ extension ChatLLMTests {
             try await Task.sleep(for: .milliseconds(5))
         }
         #expect(condition())
+    }
+
+    /// `waitUntil` for a condition that has to be awaited, such as actor state.
+    func waitUntilAsync(_ condition: @MainActor () async -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await !condition(), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await condition())
+    }
+
+    /// Returns once every block already queued on the main dispatch queue has run,
+    /// such as a Combine sink that receives on `DispatchQueue.main`. The queue is
+    /// serial, so a block enqueued now runs after them.
+    func drainMainQueue() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
     }
 
     func makeTestImage(width: Int, height: Int) -> UIImage {
@@ -135,12 +163,7 @@ extension ChatLLMTests {
     }
 
     func makeViewModel(generator: LLMGenerator = TestLLMGenerator()) throws -> ChatViewModel {
-        let schema = Schema([Conversation.self, ChatLLM.Message.self, MessageAttachment.self])
-        let container = try ModelContainer(
-            for: schema,
-            configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
-        )
-        let context = ModelContext(container)
+        let context = try makeContext()
         let conversation = Conversation(title: "Test")
         return makeIsolatedChatViewModel(
             generator: generator,

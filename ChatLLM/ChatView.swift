@@ -6,14 +6,13 @@
 //
 
 import SwiftUI
-import SwiftData
 import UniformTypeIdentifiers
 import UIKit
 import PhotosUI
-import Combine
 import OSLog
-import SafariServices
 import ImageIO
+
+nonisolated private let chatViewLogger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ChatLLM", category: "ChatView")
 
 struct ChatView: View {
     @Environment(\.locale) private var locale
@@ -51,18 +50,20 @@ struct ChatView: View {
     // Error handling states
     @State private var errorAlert: ErrorAlert?
 
-    // Performance optimization states
-    @State private var isViewAppearing = false
+    // Scroll state
+    @State private var hasAppeared = false
     @State private var isReaderNearBottom = true
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
 
     // In-app browser state
     @State private var activeURL: URL?
 
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ChatView", category: "ChatView")
+    /// How long a context-menu action waits before changing the chat. Changing focus or
+    /// presenting a sheet while UIKit is still dismissing the menu loses the change.
+    private static let menuDismissalDelay: Duration = .milliseconds(150)
 
     // Pure computed property — no side effects, no @State mutations during body evaluation.
-    // Sorting a typical message list (~10–50 items) is negligible; SwiftUI diffs the result.
+    // Read once per body pass; the message list skips re-rendering when its IDs are unchanged.
     private var sortedMessages: [Message] {
         let messages = viewModel.conversation.messages
             .filter { $0.role != .system }
@@ -73,7 +74,6 @@ struct ChatView: View {
         }
         return messages.filter { $0.order < editingSession.messageOrder }
     }
-    private var lastMessageID: UUID? { sortedMessages.last?.id }
 
     private var imageInputAvailable: Bool {
         modelBackendBridge.nativeImageInputAvailable
@@ -88,6 +88,11 @@ struct ChatView: View {
 
     /// Why the Web Search toggle is off limits, shown under it. Nil while tool
     /// calls are disabled, since that toggle sits right above it.
+    /// Forced search turns off whenever web search can't run for the next message.
+    private var forceSearchMustReset: Bool {
+        !webSearchToggleAvailable || effectiveDisableToolCalls
+    }
+
     private var webSearchUnavailableReason: String? {
         guard !webSearchToggleAvailable, !effectiveDisableToolCalls else { return nil }
         if !networkMonitor.isConnected {
@@ -155,6 +160,14 @@ struct ChatView: View {
         let requiresTitleRegeneration: Bool
     }
 
+    /// What the composer held before a send cleared it.
+    private struct ComposerRestoreState {
+        let text: String
+        let image: UIImage?
+        let forceSearch: Bool
+        let editingSession: MessageEditingSession?
+    }
+
     static func shouldPresentInAppBrowser(for url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased() else {
             return false
@@ -164,51 +177,36 @@ struct ChatView: View {
     }
 
     var body: some View {
+        let messages = sortedMessages
         VStack(spacing: 0) {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
-                    // Use ForEach with stable IDs for better performance
-                    ForEach(sortedMessages, id: \.id) { msg in
-                        MessageCellView(
-                            message: msg,
-                            viewModel: viewModel,
-                            onEdit: { message in
-                                menuSafe {
-                                    guard !viewModel.isGenerating else { return }
-
-                                    let previousInputText = editingSession?.previousInputText ?? inputText
-                                    editingSession = MessageEditingSession(
-                                        messageID: message.id,
-                                        messageOrder: message.order,
-                                        previousInputText: previousInputText
-                                    )
-                                    inputText = message.text
-                                    composerFocusRequest += 1
-                                }
-                            },
-                            onShare: { text in
-                                // Defer to allow context menu to dismiss cleanly
-                                menuSafe {
-                                    shareText = text
-                                    isSharePresented = true
-                                }
-                            }
-                        )
+                ChatMessageList(
+                    messages: messages,
+                    viewModel: viewModel,
+                    pendingReplyActivity: pendingReplyActivity(in: messages),
+                    onEdit: beginEditing,
+                    onShare: { text in
+                        // Defer to allow context menu to dismiss cleanly
+                        menuSafe {
+                            shareText = text
+                            isSharePresented = true
+                        }
                     }
-
-                    if viewModel.isGenerating,
-                       let streamingID = viewModel.streamingMessageID,
-                       !sortedMessages.contains(where: { $0.id == streamingID }) {
-                        LoadingIndicatorView(activity: viewModel.streamingActivity)
-                            .padding(.vertical, 8)
-                    }
-                }
-                .padding()
+                )
+                // Typing in the composer re-renders ChatView; the list only needs to when
+                // its messages or the pending-reply indicator change.
+                .equatable()
             }
             .scrollDismissesKeyboard(.interactively)
             .scrollPosition($scrollPosition)
-            .overlay(alignment: .bottom) { jumpToLatestButton }
-            .animation(.easeInOut(duration: 0.2), value: isReaderNearBottom)
+            .overlay(alignment: .bottom) {
+                // The animation stays on the button, so the list's own updates in the same
+                // transaction (a streaming reply, the follow scroll) aren't animated with it.
+                ZStack {
+                    jumpToLatestButton(hasMessages: !messages.isEmpty)
+                }
+                .animation(.easeInOut(duration: 0.2), value: isReaderNearBottom)
+            }
             // Short chats sit at the top edge; longer ones open at the latest message.
             // Edge-based scrolling (unlike scrolling a message to the bottom anchor) never
             // pushes short content past the top.
@@ -233,14 +231,13 @@ struct ChatView: View {
                     scrollPosition.scrollTo(edge: .bottom)
                 }
             }
-            .onAppear {
-                Task { @MainActor in
-                    isViewAppearing = true
-                    try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
-                    if !Task.isCancelled {
-                        scrollToBottom(animated: false)
-                    }
-                }
+            .task {
+                // Cancelled with the view. Settles the bottom once lazily measured rows have
+                // replaced their estimates, which the initial-offset anchor alone can miss.
+                hasAppeared = true
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled else { return }
+                scrollToBottom(animated: false)
             }
             // Scroll when streaming message changes
             .onChange(of: viewModel.streamingMessageID) { _, newID in
@@ -249,7 +246,7 @@ struct ChatView: View {
                 scrollToBottom(animated: true)
             }
             // Scroll when the last message ID changes (more precise than count)
-            .onChange(of: lastMessageID) { _, _ in
+            .onChange(of: messages.last?.id) { _, _ in
                 scrollToBottom(animated: true)
             }
         }
@@ -288,12 +285,13 @@ struct ChatView: View {
                 // Image preview (if image is attached)
                 if let image = selectedImage {
                     HStack(spacing: 12) {
-                        // Thumbnail
+                        // Thumbnail. Decorative: the label beside it says an image is attached.
                         Image(uiImage: image)
                             .resizable()
                             .aspectRatio(contentMode: .fill)
                             .frame(width: 50, height: 50)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .accessibilityHidden(true)
 
                         Text("Image attached")
                             .font(.subheadline)
@@ -341,18 +339,16 @@ struct ChatView: View {
             photoLibrary: .shared()
         )
         .onChange(of: selectedPhotoItem) { _, newItem in
+            guard let newItem else { return }
             Task {
-                guard let item = newItem else { return }
-                guard let image = await loadAndDownscaleImage(from: item) else {
-                    logger.error("Failed to load image from picker item")
-                    await MainActor.run {
-                        selectedPhotoItem = nil
-                    }
-                    await handleError(ImageError.invalidFormat, title: String(localized: "Photo Import Failed", bundle: .appLocalized), retry: nil)
+                let image = await loadAttachmentImage(from: newItem)
+                selectedPhotoItem = nil
+                guard let image else {
+                    chatViewLogger.error("Failed to load image from picker item")
+                    presentError(ImageError.invalidFormat, title: String(localized: "Photo Import Failed", bundle: .appLocalized))
                     return
                 }
-                await prepareSelectedImage(image)
-                await MainActor.run { selectedPhotoItem = nil }
+                setSelectedImage(image)
             }
         }
         .alert(item: $errorAlert) { alert in
@@ -380,36 +376,20 @@ struct ChatView: View {
                 do {
                     try await handleFileImporterResult(result)
                 } catch {
-                    await handleError(error, title: String(localized: "File Import Failed", bundle: .appLocalized), retry: nil)
+                    presentError(error, title: String(localized: "File Import Failed", bundle: .appLocalized))
                 }
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            switch phase {
-            case .background:
-                break
-            case .active:
-                // Someone who scrolled up to read keeps their place when they come back.
-                if isViewAppearing, isReaderNearBottom {
-                    scrollToBottom(animated: false)
-                }
-            default:
-                break
+            // Someone who scrolled up to read keeps their place when they come back.
+            if phase == .active, hasAppeared, isReaderNearBottom {
+                scrollToBottom(animated: false)
             }
         }
-        // Reset force search when network becomes unavailable
-        .onChange(of: networkMonitor.isConnected) { _, isConnected in
-            if !isConnected && forceSearch {
-                forceSearch = false
-            }
-        }
-        .onChange(of: effectiveDisableToolCalls) { _, isDisabled in
-            if isDisabled && forceSearch {
-                forceSearch = false
-            }
-        }
-        .onChange(of: webSearchToggleAvailable) { _, isAvailable in
-            if !isAvailable && forceSearch {
+        // Covers losing the network, attaching an image, a backend without tool calls,
+        // a missing search key and turning tool calls off.
+        .onChange(of: forceSearchMustReset) { _, mustReset in
+            if mustReset && forceSearch {
                 forceSearch = false
             }
         }
@@ -427,9 +407,7 @@ struct ChatView: View {
         }
         .sheet(isPresented: $showCameraCapture) {
             CameraCapturePicker(isPresented: $showCameraCapture) { image in
-                Task {
-                    await prepareSelectedImage(image)
-                }
+                setSelectedImage(image)
             }
                 .ignoresSafeArea()
         }
@@ -437,13 +415,11 @@ struct ChatView: View {
 
     @ViewBuilder
     private var composer: some View {
-        ComposerView(
+        SimpleTextComposer(
             text: $inputText,
             placeholder: String(localized: "Ask anything", bundle: .appLocalized, locale: locale),
             focusRequest: composerFocusRequest,
             isEditing: editingSession != nil,
-            canSend: selectedImage != nil || !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-            isGenerating: viewModel.isGenerating,
             onSend: {
                 Task { await sendIfPossible() }
             },
@@ -451,6 +427,9 @@ struct ChatView: View {
                 viewModel.cancelGeneration()
             },
             onCancelEditing: cancelEditing,
+            canSend: !viewModel.isBusy
+                && (selectedImage != nil || !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
+            isGenerating: viewModel.isGenerating,
             onCamera: {
                 showCameraCapture = true
             },
@@ -477,13 +456,15 @@ struct ChatView: View {
             reasoningAvailable: modelBackendBridge.reasoningAvailable,
             reasoningRequired: modelBackendBridge.reasoningRequired
         )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Message composer")
     }
 
     /// Shown once the reader scrolls away from the latest message, so a long chat
     /// or a reply that keeps growing below them is one tap from the bottom.
     @ViewBuilder
-    private var jumpToLatestButton: some View {
-        if !isReaderNearBottom && !sortedMessages.isEmpty {
+    private func jumpToLatestButton(hasMessages: Bool) -> some View {
+        if !isReaderNearBottom && hasMessages {
             Button {
                 scrollToBottom(animated: true)
             } label: {
@@ -508,48 +489,83 @@ struct ChatView: View {
         viewModel.conversation.messages.contains { $0.role != .system }
     }
 
+    /// The activity shown under the list while a reply is starting and has no message yet.
+    private func pendingReplyActivity(in messages: [Message]) -> StreamingActivity? {
+        guard viewModel.isGenerating,
+              let streamingID = viewModel.streamingMessageID,
+              !messages.contains(where: { $0.id == streamingID }) else {
+            return nil
+        }
+        return viewModel.streamingActivity
+    }
+
     // MARK: - Helper Methods
 
+    private func beginEditing(_ message: Message) {
+        menuSafe {
+            guard !viewModel.isBusy else { return }
+
+            let previousInputText = editingSession?.previousInputText ?? inputText
+            editingSession = MessageEditingSession(
+                messageID: message.id,
+                messageOrder: message.order,
+                previousInputText: previousInputText
+            )
+            inputText = message.text
+            composerFocusRequest += 1
+        }
+    }
+
     private func sendIfPossible() async {
+        // A regeneration that is still unwinding refuses new messages too.
+        guard !viewModel.isBusy else { return }
         let textToSend = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Check if we have an image to send
         if let image = selectedImage {
-            guard !viewModel.isGenerating else { return }
             // An image picked before switching to a text-only model stays in
             // the composer; that model would answer without seeing it.
             guard imageInputAvailable else {
-                await handleError(
+                presentError(
                     ImageError.unsupportedByModel,
-                    title: String(localized: "Can't Send Image", bundle: .appLocalized),
-                    retry: nil
+                    title: String(localized: "Can't Send Image", bundle: .appLocalized)
                 )
                 return
             }
 
-            // Shown as the user's message, so it follows the app language.
-            let replacementText = textToSend.isEmpty
-                ? String(localized: "Describe what you see", bundle: .appLocalized)
-                : textToSend
+            let replacementText = textToSend.isEmpty ? ChatViewModel.defaultImagePrompt : textToSend
+            let draft = ComposerRestoreState(
+                text: inputText,
+                image: image,
+                forceSearch: forceSearch,
+                editingSession: editingSession
+            )
             guard let editingCommit = commitEditingIfNeeded(replacementText: replacementText) else { return }
 
             // Clear immediately for snappy feel, then send
             inputText = ""
             clearSelectedImage()
 
-            Task {
-                await viewModel.sendWithImage(
-                    text: replacementText,
-                    image: image,
-                    regenerateTitle: editingCommit.requiresTitleRegeneration,
-                    editedUserMessageID: editingCommit.messageID
-                )
+            let sent = await viewModel.trySendWithImage(
+                text: replacementText,
+                image: image,
+                regenerateTitle: editingCommit.requiresTitleRegeneration,
+                editedUserMessageID: editingCommit.messageID
+            )
+            if !sent {
+                restoreComposer(draft, afterCommit: editingCommit)
             }
             return
         }
 
         // Normal text-only message
-        guard !viewModel.isGenerating, !textToSend.isEmpty else { return }
+        guard !textToSend.isEmpty else { return }
+        let draft = ComposerRestoreState(
+            text: inputText,
+            image: nil,
+            forceSearch: forceSearch,
+            editingSession: editingSession
+        )
         guard let editingCommit = commitEditingIfNeeded(replacementText: textToSend) else { return }
 
         let shouldSearch = forceSearch
@@ -559,15 +575,42 @@ struct ChatView: View {
         inputText = ""
         forceSearch = false
 
-        Task {
-            await viewModel.send(
-                userText: textToSend,
-                forceSearch: shouldSearch,
-                disableToolCalls: shouldDisableToolCalls,
-                regenerateTitle: editingCommit.requiresTitleRegeneration,
-                editedUserMessageID: editingCommit.messageID
+        let sent = await viewModel.trySend(
+            userText: textToSend,
+            forceSearch: shouldSearch,
+            disableToolCalls: shouldDisableToolCalls,
+            regenerateTitle: editingCommit.requiresTitleRegeneration,
+            editedUserMessageID: editingCommit.messageID
+        )
+        if !sent {
+            restoreComposer(draft, afterCommit: editingCommit)
+        }
+    }
+
+    /// Gives a refused message back to the composer, so the user doesn't lose what they typed.
+    /// An edit that was already committed stays an edit of the same message.
+    private func restoreComposer(_ draft: ComposerRestoreState, afterCommit commit: MessageEditingCommit) {
+        // Something typed while the refused send was waiting wins over the old draft.
+        if inputText.isEmpty {
+            inputText = draft.text
+        }
+        if selectedImage == nil, let image = draft.image {
+            setSelectedImage(image)
+        }
+        if draft.forceSearch && !forceSearchMustReset {
+            forceSearch = true
+        }
+        if editingSession == nil,
+           let previous = draft.editingSession,
+           let messageID = commit.messageID,
+           let message = viewModel.conversation.messages.first(where: { $0.id == messageID }) {
+            editingSession = MessageEditingSession(
+                messageID: messageID,
+                messageOrder: message.order,
+                previousInputText: previous.previousInputText
             )
         }
+        chatViewLogger.notice("Message was not sent; restored it to the composer")
     }
 
     private func cancelEditing() {
@@ -606,9 +649,9 @@ struct ChatView: View {
         }
     }
 
-    @MainActor
-    private func handleError(_ error: Error, title: String, retry: (() -> Void)?) async {
-        logger.error("Error in ChatView: \(error.localizedDescription)")
+    private func presentError(_ error: Error, title: String, retry: (() -> Void)? = nil) {
+        // Image and file errors describe the failure, never the user's content.
+        chatViewLogger.error("Error in ChatView: \(error.localizedDescription, privacy: .public)")
 
         let message: String
         if let localizedError = error as? LocalizedError {
@@ -637,22 +680,14 @@ struct ChatView: View {
             }
             defer { url.stopAccessingSecurityScopedResource() }
 
-            guard let image = decodeThumbnailImage(
-                from: url,
-                maxPixelSize: 2_048
-            ) else {
+            // Reading a file (possibly from iCloud) and decoding it stays off the main actor.
+            guard let image = await AttachmentImageDecoder.thumbnail(from: url) else {
                 throw ImageError.invalidFormat
             }
-            await prepareSelectedImage(image)
-        case .failure(let error):
-            logger.error("File importer failed: \(error.localizedDescription)")
-            throw error
-        }
-    }
-
-    private func prepareSelectedImage(_ image: UIImage) async {
-        await MainActor.run {
             setSelectedImage(image)
+        case .failure(let error):
+            chatViewLogger.error("File importer failed: \(error.localizedDescription, privacy: .public)")
+            throw error
         }
     }
 
@@ -663,18 +698,16 @@ struct ChatView: View {
             inputText = draft.text
         }
         if selectedImage == nil, let image = draft.image {
-            Task { await prepareSelectedImage(image) }
+            setSelectedImage(image)
         }
     }
 
-    @MainActor
     private func setSelectedImage(_ image: UIImage) {
         selectedImage = image
         selectedImageToken = UUID()
         forceSearch = false
     }
 
-    @MainActor
     private func clearSelectedImage() {
         selectedImage = nil
         selectedImageToken = UUID()
@@ -705,56 +738,91 @@ struct ChatView: View {
     // Small helper: run UI mutations after menus have time to dismiss
     private func menuSafe(_ action: @escaping () -> Void) {
         Task { @MainActor in
-            // Yield once and add a tiny delay to ensure UIKit menu dismissal completes
             await Task.yield()
-            try? await Task.sleep(nanoseconds: 150_000_000) // ~150 ms
+            try? await Task.sleep(for: Self.menuDismissalDelay)
             action()
         }
     }
 
-    // MARK: - Image Downscaling
+    // MARK: - Image Loading
 
-    // Load a PhotosPickerItem directly through ImageIO at the pipeline budget.
-    private func loadAndDownscaleImage(from item: PhotosPickerItem) async -> UIImage? {
-        if let thumbnail = try? await loadThumbnailImage(from: item, maxPixelSize: 1_200) {
-            return thumbnail
-        }
-        return nil
-    }
-
-    private func loadThumbnailImage(
-        from item: PhotosPickerItem,
-        maxPixelSize: Int
-    ) async throws -> UIImage? {
-        guard let data = try await item.loadTransferable(type: Data.self) else {
+    /// Loads a picked photo at the attachment budget. The original can be tens of
+    /// megabytes, so decoding happens off the main actor.
+    private func loadAttachmentImage(from item: PhotosPickerItem) async -> UIImage? {
+        guard let data = try? await item.loadTransferable(type: Data.self) else {
             return nil
         }
-        return decodeThumbnailImage(from: data, maxPixelSize: maxPixelSize)
+        return await AttachmentImageDecoder.thumbnail(from: data)
+    }
+}
+
+// MARK: - Message List
+
+/// The conversation's messages. Equatable on what it lays out, so composer keystrokes,
+/// which re-render ChatView, don't rebuild and re-diff every cell. Cells observe their
+/// own message and the view model's `streamingState`, so they still update while a reply streams.
+private struct ChatMessageList: View, Equatable {
+    let messages: [Message]
+    let viewModel: ChatViewModel
+    /// Shown under the list while a reply is starting and has no message yet.
+    let pendingReplyActivity: StreamingActivity?
+    let onEdit: (Message) -> Void
+    let onShare: (String) -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.viewModel === rhs.viewModel
+            && lhs.pendingReplyActivity == rhs.pendingReplyActivity
+            && lhs.messages.map(\.id) == rhs.messages.map(\.id)
     }
 
-    private func decodeThumbnailImage(from data: Data, maxPixelSize: Int) -> UIImage? {
-        data.withUnsafeBytes { buffer in
-            guard let baseAddress = buffer.baseAddress else { return nil }
-            let cfData = CFDataCreate(kCFAllocatorDefault, baseAddress.assumingMemoryBound(to: UInt8.self), data.count)
-            guard let cfData,
-                  let source = CGImageSourceCreateWithData(cfData, nil) else {
-                return nil
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 14) {
+            // Use ForEach with stable IDs for better performance
+            ForEach(messages, id: \.id) { msg in
+                MessageCellView(
+                    message: msg,
+                    viewModel: viewModel,
+                    onEdit: onEdit,
+                    onShare: onShare
+                )
             }
-            return decodeThumbnailImage(from: source, maxPixelSize: maxPixelSize)
+
+            if let pendingReplyActivity {
+                StreamingActivityIndicator(activity: pendingReplyActivity)
+                    .padding(.vertical, 8)
+            }
         }
+        .padding()
+    }
+}
+
+// MARK: - Attachment Image Decoding
+
+/// Decodes picked photos and files into bounded attachment images away from the main actor.
+nonisolated enum AttachmentImageDecoder {
+    /// Longest side of an attached image, in pixels. Matches the size ImageStore saves
+    /// attachments at, so a larger decode would only be downscaled again on save.
+    static let pixelBudget = 1_200
+
+    @concurrent
+    static func thumbnail(from data: Data, maxPixelSize: Int = pixelBudget) async -> UIImage? {
+        // Bridging shares Data's buffer; copying it into a new CFData would double the
+        // memory of a large original.
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return nil
+        }
+        return thumbnail(from: source, maxPixelSize: maxPixelSize)
     }
 
-    private func decodeThumbnailImage(from url: URL, maxPixelSize: Int) -> UIImage? {
+    @concurrent
+    static func thumbnail(from url: URL, maxPixelSize: Int = pixelBudget) async -> UIImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             return nil
         }
-        return decodeThumbnailImage(from: source, maxPixelSize: maxPixelSize)
+        return thumbnail(from: source, maxPixelSize: maxPixelSize)
     }
 
-    private func decodeThumbnailImage(
-        from source: CGImageSource,
-        maxPixelSize: Int
-    ) -> UIImage? {
+    private static func thumbnail(from source: CGImageSource, maxPixelSize: Int) -> UIImage? {
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -805,11 +873,12 @@ private struct CameraCapturePicker: UIViewControllerRepresentable {
                 let pixelWidth = image.size.width * image.scale
                 let pixelHeight = image.size.height * image.scale
                 let maxSide = max(pixelWidth, pixelHeight)
-                guard maxSide > 1_200 else {
+                let budget = CGFloat(AttachmentImageDecoder.pixelBudget)
+                guard maxSide > budget else {
                     parent.onCapture(image)
                     return
                 }
-                let ratio = 1_200 / maxSide
+                let ratio = budget / maxSide
                 let targetSize = CGSize(
                     width: (pixelWidth * ratio).rounded(),
                     height: (pixelHeight * ratio).rounded()

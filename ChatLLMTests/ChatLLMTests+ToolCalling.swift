@@ -52,14 +52,14 @@ extension ChatLLMTests {
         #expect(!MLXModelManager.usesWrappedXMLToolCallTemplate(packageContents: packageContents))
     }
 
-    @Test func wrappedXMLToolCallStreamFilterSuppressesToolMarkup() async {
-        let filter = WrappedXMLToolCallStreamFilter()
+    @Test func wrappedXMLToolCallStreamFilterSuppressesToolMarkup() {
+        var filter = WrappedXMLToolCallStreamFilter()
 
-        let firstChunk = await filter.consume("I will check that.\n<tool")
-        let secondChunk = await filter.consume("_call>\n<function=webSearch>")
-        let thirdChunk = await filter.consume("\n<parameter=query>\nlatest OpenAI model\n</parameter>")
-        await filter.didDispatchToolCall()
-        let trailingChunk = await filter.finish()
+        let firstChunk = filter.consume("I will check that.\n<tool")
+        let secondChunk = filter.consume("_call>\n<function=webSearch>")
+        let thirdChunk = filter.consume("\n<parameter=query>\nlatest OpenAI model\n</parameter>")
+        filter.didDispatchToolCall()
+        let trailingChunk = filter.finish()
 
         #expect(firstChunk == "I will check that.\n")
         #expect(secondChunk == nil)
@@ -67,25 +67,25 @@ extension ChatLLMTests {
         #expect(trailingChunk == nil)
     }
 
-    @Test func wrappedXMLToolCallStreamFilterResumesAfterClosedWrapperWithoutToolEvent() async {
-        let filter = WrappedXMLToolCallStreamFilter()
+    @Test func wrappedXMLToolCallStreamFilterResumesAfterClosedWrapperWithoutToolEvent() {
+        var filter = WrappedXMLToolCallStreamFilter()
 
-        let visible = await filter.consume(
+        let visible = filter.consume(
             "Before <tool_call><function=webSearch></function></tool_call>After"
         )
-        let trailing = await filter.finish()
+        let trailing = filter.finish()
 
         #expect(visible == "Before After")
         #expect(trailing == nil)
     }
 
-    @Test func wrappedXMLToolCallStreamFilterRecoversTrailingTextAfterMalformedOuterWrapper() async {
-        let filter = WrappedXMLToolCallStreamFilter()
+    @Test func wrappedXMLToolCallStreamFilterRecoversTrailingTextAfterMalformedOuterWrapper() {
+        var filter = WrappedXMLToolCallStreamFilter()
 
-        let visible = await filter.consume(
+        let visible = filter.consume(
             "Before <tool_call><function=webSearch></function>After"
         )
-        let trailing = await filter.finish()
+        let trailing = filter.finish()
 
         #expect(visible == "Before ")
         #expect(trailing == "After")
@@ -110,9 +110,9 @@ extension ChatLLMTests {
         #expect(content == "<tool_response>\nSearch result body\n</tool_response>")
     }
 
-    @Test func qwenToolResponsesReuseWrappedUserPromptCompatibilityPath() {
+    @Test func qwenToolResponsesReuseWrappedUserPromptCompatibilityPath() throws {
         let manager = makeModelManager()
-        let model = try! #require(manager.model(withID: "qwen3.5-2b-4bit"))
+        let model = try #require(manager.model(withID: "qwen3.5-2b-4bit"))
 
         let content = MLXModelManager.toolResponsePromptContent(
             for: model,
@@ -124,9 +124,9 @@ extension ChatLLMTests {
         #expect(role == .user)
     }
 
-    @Test func qwenToolResponsesRequireExplicitMessageHistoryAcrossToolLoop() {
+    @Test func qwenToolResponsesRequireExplicitMessageHistoryAcrossToolLoop() throws {
         let manager = makeModelManager()
-        let model = try! #require(manager.model(withID: "qwen3.5-2b-4bit"))
+        let model = try #require(manager.model(withID: "qwen3.5-2b-4bit"))
 
         #expect(MLXModelManager.requiresExplicitMessageHistoryForToolLoop(for: model))
     }
@@ -158,9 +158,9 @@ extension ChatLLMTests {
         #expect(scope == .none)
     }
 
-    @Test func lfm25ToolResponsesUseNativeToolRole() {
+    @Test func lfm25ToolResponsesUseNativeToolRole() throws {
         let manager = makeModelManager()
-        let model = try! #require(manager.model(withID: "lfm2.5-2.6b-4bit"))
+        let model = try #require(manager.model(withID: "lfm2.5-2.6b-4bit"))
 
         let content = MLXModelManager.toolResponsePromptContent(
             for: model,

@@ -14,6 +14,17 @@ struct PrivacySettingsView: View {
     @State private var deletion: SettingsDataAction?
     @State private var showingDeletionConfirmation = false
 
+    static let retentionDayOptions = [7, 14, 30, 60, 90]
+
+    /// The retention choices, plus a stored period that isn't one of them, so the picker
+    /// never shows an empty selection while auto-delete keeps using that period.
+    static func retentionDayOptions(including storedDays: Int) -> [Int] {
+        guard storedDays > 0, !retentionDayOptions.contains(storedDays) else {
+            return retentionDayOptions
+        }
+        return (retentionDayOptions + [storedDays]).sorted()
+    }
+
     var body: some View {
         Form {
             Section {
@@ -21,7 +32,7 @@ struct PrivacySettingsView: View {
                     .accessibilityIdentifier("settings.autoDelete")
                 if settings.autoDeleteOldChats {
                     Picker("Delete After", selection: $settings.autoDeleteDays) {
-                        ForEach([7, 14, 30, 60, 90], id: \.self) { days in
+                        ForEach(Self.retentionDayOptions(including: settings.autoDeleteDays), id: \.self) { days in
                             Text("\(days) days").tag(days)
                         }
                     }

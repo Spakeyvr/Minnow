@@ -65,13 +65,16 @@ extension ChatLLMTests {
         )
     }
 
+    /// Saved through the shared store, because attachments resolve to the app's
+    /// attachments folder; the test environment deletes it when the test ends.
     private func saveTestImage() async throws -> URL {
-        try await ImageStore.shared.save(image: makeTestImage(width: 64, height: 48), maxDimension: 64)
+        let url = try await ImageStore.shared.save(image: makeTestImage(width: 64, height: 48), maxDimension: 64)
+        testEnvironment.removeAfterTest([url])
+        return url
     }
 
     @Test func buildFoundationRequestSendsTheLatestImageWithThePlainQuestion() async throws {
         let imageURL = try await saveTestImage()
-        defer { Task { try? await ImageStore.shared.delete(url: imageURL) } }
         let viewModel = try makeViewModel()
         let turn = appendImageTurn(
             to: viewModel,
@@ -91,7 +94,6 @@ extension ChatLLMTests {
 
     @Test func buildFoundationRequestSendsOnlyTheQuestionWhenImagesAreNotIncluded() async throws {
         let imageURL = try await saveTestImage()
-        defer { Task { try? await ImageStore.shared.delete(url: imageURL) } }
         let viewModel = try makeViewModel()
         appendImageTurn(to: viewModel, text: "What does the sign say?", order: 0, imageURL: imageURL)
 
@@ -104,7 +106,6 @@ extension ChatLLMTests {
     @Test func buildFoundationRequestSendsTheThreeNewestImagesAcrossTurns() async throws {
         var urls: [URL] = []
         for _ in 0..<4 { urls.append(try await saveTestImage()) }
-        defer { Task { for url in urls { try? await ImageStore.shared.delete(url: url) } } }
         let viewModel = try makeViewModel()
         let questions = ["What is this?", "And this?", "How about this?", "Last one?"]
         var turns: [(message: ChatLLM.Message, attachment: MessageAttachment)] = []
@@ -131,7 +132,6 @@ extension ChatLLMTests {
     @Test func buildFoundationRequestKeepsTheNewestImagesOfATurnOverTheLimit() async throws {
         var urls: [URL] = []
         for _ in 0..<4 { urls.append(try await saveTestImage()) }
-        defer { Task { for url in urls { try? await ImageStore.shared.delete(url: url) } } }
         let viewModel = try makeViewModel()
         let turn = appendImageTurn(to: viewModel, text: "Compare these.", order: 0, imageURL: urls[0])
         for url in urls.dropFirst() {
@@ -199,7 +199,6 @@ extension ChatLLMTests {
 
     @Test func buildFoundationRequestStripsLegacyInlineImageDescriptions() async throws {
         let imageURL = try await saveTestImage()
-        defer { Task { try? await ImageStore.shared.delete(url: imageURL) } }
         let viewModel = try makeViewModel()
         appendImageTurn(to: viewModel, text: Self.legacyImageTurnText, order: 0, imageURL: imageURL)
 
@@ -213,16 +212,15 @@ extension ChatLLMTests {
         #expect(textRequest.prompt == "What does the sign say?")
     }
 
-    @Test func buildQwenMessagesStripsLegacyInlineImageDescriptions() async throws {
+    @Test func buildMLXPromptStripsLegacyInlineImageDescriptions() async throws {
         let imageURL = try await saveTestImage()
-        defer { Task { try? await ImageStore.shared.delete(url: imageURL) } }
         let viewModel = try makeViewModel()
         appendImageTurn(to: viewModel, text: Self.legacyImageTurnText, order: 0, imageURL: imageURL)
 
-        let messages = try await viewModel.buildQwenMessages(
+        let messages = try await viewModel.buildMLXPrompt(
             upToOrderExclusive: 1,
             includeLatestUserImages: false
-        )
+        ).messages
         let userMessage = try #require(messages.last(where: { $0.role == .user }))
 
         #expect(userMessage.content == "What does the sign say?")

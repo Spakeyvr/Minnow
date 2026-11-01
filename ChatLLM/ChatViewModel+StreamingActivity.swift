@@ -7,7 +7,52 @@
 //
 
 import Foundation
+import Observation
 import UIKit
+
+/// The streaming status of one chat. Unlike `ChatViewModel`'s `objectWillChange`, which
+/// invalidates every view holding the view model, each property here is tracked on its
+/// own: a message cell that calls `isStreaming(_:)` re-renders only when generation
+/// starts or stops or the streaming message changes, and only the views that read
+/// `activity` re-render when the status label changes.
+@MainActor
+@Observable
+final class ChatStreamingState {
+    var isGenerating = false
+    var streamingMessageID: UUID?
+    var activity: StreamingActivity = .loading
+
+    func isStreaming(_ messageID: UUID) -> Bool {
+        isGenerating && streamingMessageID == messageID
+    }
+}
+
+/// Timing of the glow that sweeps across the streaming status label. The label draws the
+/// sweep, and the view model waits for it before changing the label's text.
+nonisolated enum ShimmerTiming {
+    static let period: TimeInterval = 1.6
+    /// Half the glow band's width, as a fraction of the label's width.
+    static let bandHalfWidth: CGFloat = 0.25
+
+    /// The band's centre: sweeps from -0.4 to 1.4 once per period, phase-locked to the clock.
+    static func offset(at date: Date) -> CGFloat {
+        let phase = date.timeIntervalSinceReferenceDate
+            .truncatingRemainder(dividingBy: period) / period
+        return -0.4 + 1.8 * CGFloat(phase)
+    }
+
+    /// Time until the glow band currently crossing the label has left it, or 0 when no band
+    /// is over the label. Swapping the text then never cuts a sweep off mid-word.
+    static func remainingSweepDuration(at date: Date) -> TimeInterval {
+        let centre = offset(at: date)
+        let bandIsOverLabel = centre + bandHalfWidth > 0 && centre - bandHalfWidth < 1
+        guard bandIsOverLabel else { return 0 }
+        let phase = date.timeIntervalSinceReferenceDate
+            .truncatingRemainder(dividingBy: period) / period
+        let phaseWhenBandLeaves = (1 + bandHalfWidth + 0.4) / 1.8
+        return (Double(phaseWhenBandLeaves) - phase) * period
+    }
+}
 
 enum StreamingActivity: Equatable {
     case loading
@@ -45,7 +90,7 @@ extension ChatViewModel {
 
         let delay = UIAccessibility.isReduceMotionEnabled
             ? 0
-            : InlineThinkingView.remainingSweepDuration(at: now)
+            : ShimmerTiming.remainingSweepDuration(at: now)
         guard delay > 0 else {
             applyPendingStreamingActivity()
             return

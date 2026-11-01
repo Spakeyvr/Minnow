@@ -10,6 +10,11 @@ import CoreGraphics
 import UIKit
 
 final class ChatLLMUITests: XCTestCase {
+    /// Launch-time measurements take several cold launches, so they only run on request.
+    static var runsPerformanceTests: Bool {
+        ProcessInfo.processInfo.environment["CHATLLM_RUN_PERFORMANCE_TESTS"] == "1"
+    }
+
     private let firstMLXModelID = "qwen3.5-4b-4bit-hybrid"
     private let secondMLXModelID = "qwen3.5-2b-4bit"
 
@@ -34,7 +39,7 @@ final class ChatLLMUITests: XCTestCase {
                 .firstMatch
             XCTAssertTrue(secondParagraph.exists)
             XCTAssertTrue(secondParagraph.label.contains("first_name"))
-            XCTAssertEqual(app.staticTexts["markdown.status"].label, "Streaming")
+            assertLabel(of: app.staticTexts["markdown.status"], becomes: "Streaming")
             captureSettingsScreenshot("markdown-\(reasoning ? "reasoning" : "standard")-paragraphs", in: app)
 
             app.buttons["markdown.advance"].tap()
@@ -44,12 +49,12 @@ final class ChatLLMUITests: XCTestCase {
             XCTAssertTrue(app.staticTexts["Second item"].exists)
             XCTAssertTrue(app.staticTexts["let first_name = 1"].exists)
             XCTAssertFalse(app.webViews.firstMatch.exists)
-            XCTAssertEqual(app.staticTexts["markdown.status"].label, "Streaming")
+            assertLabel(of: app.staticTexts["markdown.status"], becomes: "Streaming")
             captureSettingsScreenshot("markdown-\(reasoning ? "reasoning" : "standard")-streaming", in: app)
 
             app.buttons["markdown.advance"].tap()
             XCTAssertTrue(app.staticTexts["Last paragraph."].waitForExistence(timeout: 5))
-            XCTAssertEqual(app.staticTexts["markdown.status"].label, "Finished")
+            assertLabel(of: app.staticTexts["markdown.status"], becomes: "Finished")
             XCTAssertTrue(app.staticTexts["First item"].exists)
             XCTAssertFalse(app.webViews.firstMatch.exists)
             captureSettingsScreenshot("markdown-\(reasoning ? "reasoning" : "standard")-finished", in: app)
@@ -73,7 +78,7 @@ final class ChatLLMUITests: XCTestCase {
         XCTAssertGreaterThanOrEqual(copy.frame.height, 44)
         XCTAssertEqual(copy.label, "Copy Code")
         copy.tap()
-        XCTAssertEqual(copy.label, "Copied")
+        assertLabel(of: copy, becomes: "Copied")
         let restored = expectation(for: NSPredicate(format: "label == %@", "Copy Code"), evaluatedWith: copy)
         wait(for: [restored], timeout: 4)
     }
@@ -98,7 +103,7 @@ final class ChatLLMUITests: XCTestCase {
 
         XCTAssertEqual(copy.label, "Copy")
         copy.tap()
-        XCTAssertEqual(copy.label, "Copied")
+        assertLabel(of: copy, becomes: "Copied")
         let restored = expectation(for: NSPredicate(format: "label == %@", "Copy"), evaluatedWith: copy)
         wait(for: [restored], timeout: 4)
     }
@@ -156,9 +161,13 @@ final class ChatLLMUITests: XCTestCase {
         app.terminate()
     }
 
+    /// `fastFakeDownloads` finishes fake downloads at once, for tests that wait for
+    /// a download to complete rather than look at its progress.
+    @MainActor
     private func launchApp(
         resetAppState: Bool = true,
-        fakeMLXDownloads: Bool = false
+        fakeMLXDownloads: Bool = false,
+        fastFakeDownloads: Bool = false
     ) -> XCUIApplication {
         let app = XCUIApplication()
         if resetAppState {
@@ -167,10 +176,14 @@ final class ChatLLMUITests: XCTestCase {
         if fakeMLXDownloads {
             app.launchArguments.append("-ui-test-fake-mlx-downloads")
         }
+        if fastFakeDownloads {
+            app.launchArguments.append("-ui-test-fast-fake-mlx-downloads")
+        }
         app.launch()
         return app
     }
 
+    @MainActor
     private func element(in app: XCUIApplication, identifier: String) -> XCUIElement {
         app.descendants(matching: .any)[identifier]
     }
@@ -198,8 +211,8 @@ final class ChatLLMUITests: XCTestCase {
         app.terminate()
 
         let relaunchedApp = launchApp(resetAppState: false)
-        XCTAssertFalse(relaunchedApp.otherElements["onboarding.root"].waitForExistence(timeout: 2))
         XCTAssertTrue(relaunchedApp.otherElements["content.root"].waitForExistence(timeout: 5))
+        XCTAssertFalse(relaunchedApp.otherElements["onboarding.root"].exists)
     }
 
     @MainActor
@@ -220,19 +233,19 @@ final class ChatLLMUITests: XCTestCase {
         app.terminate()
 
         let relaunchedApp = launchApp(resetAppState: false)
-        XCTAssertFalse(relaunchedApp.otherElements["onboarding.root"].waitForExistence(timeout: 2))
         XCTAssertTrue(relaunchedApp.otherElements["content.root"].waitForExistence(timeout: 5))
+        XCTAssertFalse(relaunchedApp.otherElements["onboarding.root"].exists)
     }
 
     @MainActor
     func testSkippingAfterTypingATavilyKeyKeepsTheKey() throws {
         let app = launchApp()
-        XCTAssertEqual(element(in: app, identifier: "onboarding.progress").label, "Step 1 of 3")
+        assertLabel(of: element(in: app, identifier: "onboarding.progress"), becomes: "Step 1 of 3")
 
         app.buttons["onboarding.intro.continue"].tap()
         let keyField = app.secureTextFields["onboarding.tavily.key"]
         XCTAssertTrue(keyField.waitForExistence(timeout: 5))
-        XCTAssertEqual(element(in: app, identifier: "onboarding.progress").label, "Step 2 of 3")
+        assertLabel(of: element(in: app, identifier: "onboarding.progress"), becomes: "Step 2 of 3")
         keyField.tap()
         keyField.typeText("tvly-test-key")
 
@@ -284,7 +297,7 @@ final class ChatLLMUITests: XCTestCase {
 
     @MainActor
     func testDownloadedModelIsMarkedAndNamedPlainlyInTheMenu() throws {
-        let app = launchApp(fakeMLXDownloads: true)
+        let app = launchApp(fakeMLXDownloads: true, fastFakeDownloads: true)
         XCTAssertTrue(app.buttons["onboarding.skip"].waitForExistence(timeout: 5))
         app.buttons["onboarding.skip"].tap()
         XCTAssertTrue(app.textViews.firstMatch.waitForExistence(timeout: 5))
@@ -294,7 +307,7 @@ final class ChatLLMUITests: XCTestCase {
         let download = app.buttons["modelSelection.download.qwen3.5-0.8b-4bit"]
         XCTAssertTrue(download.waitForExistence(timeout: 5))
         download.tap()
-        XCTAssertTrue(element(in: app, identifier: "modelSelection.downloaded.qwen3.5-0.8b-4bit").waitForExistence(timeout: 20))
+        XCTAssertTrue(element(in: app, identifier: "modelSelection.downloaded.qwen3.5-0.8b-4bit").waitForExistence(timeout: 5))
         // The icon-only row buttons are named for VoiceOver.
         XCTAssertTrue(app.buttons["Delete"].exists)
         XCTAssertTrue(app.buttons["Model Information"].firstMatch.exists)
@@ -342,29 +355,36 @@ final class ChatLLMUITests: XCTestCase {
 
     @MainActor
     func testDeletingTheSelectedModelLeavesItUnselected() throws {
-        let app = launchApp(fakeMLXDownloads: true)
+        let app = launchApp(fakeMLXDownloads: true, fastFakeDownloads: true)
         XCTAssertTrue(app.buttons["onboarding.skip"].waitForExistence(timeout: 5))
         app.buttons["onboarding.skip"].tap()
         XCTAssertTrue(app.textViews.firstMatch.waitForExistence(timeout: 5))
 
         app.navigationBars.staticTexts["Apple Intelligence"].firstMatch.tap()
         app.buttons["Manage Models"].tap()
-        app.buttons["modelSelection.download.qwen3.5-0.8b-4bit"].tap()
-        XCTAssertTrue(element(in: app, identifier: "modelSelection.downloaded.qwen3.5-0.8b-4bit").waitForExistence(timeout: 20))
+        let download = app.buttons["modelSelection.download.qwen3.5-0.8b-4bit"]
+        XCTAssertTrue(download.waitForExistence(timeout: 5))
+        download.tap()
+        XCTAssertTrue(element(in: app, identifier: "modelSelection.downloaded.qwen3.5-0.8b-4bit").waitForExistence(timeout: 5))
         app.buttons["Done"].tap()
 
         app.navigationBars.staticTexts["Apple Intelligence"].firstMatch.tap()
         app.buttons["Qwen 3.5 0.8B (4-bit)"].tap()
-        // The fake download has no files, so loading it reports an error.
-        let loadError = app.alerts.firstMatch
-        if loadError.waitForExistence(timeout: 3) { loadError.buttons.firstMatch.tap() }
         let qwenTitle = app.navigationBars.staticTexts["Qwen 3.5 0.8B (4-bit)"].firstMatch
         XCTAssertTrue(qwenTitle.waitForExistence(timeout: 3))
 
+        // The fake download has no files, so the load failed; Manage Models reports it.
         qwenTitle.tap()
         app.buttons["Manage Models"].tap()
+        let loadError = app.alerts["Model Error"]
+        XCTAssertTrue(loadError.waitForExistence(timeout: 5))
+        loadError.buttons["OK"].tap()
+        XCTAssertTrue(loadError.waitForNonExistence(timeout: 3))
+
         app.buttons["Delete"].firstMatch.tap()
-        app.alerts.buttons["Delete"].tap()
+        let confirmDelete = app.alerts.buttons["Delete"]
+        XCTAssertTrue(confirmDelete.waitForExistence(timeout: 3))
+        confirmDelete.tap()
         app.buttons["Done"].tap()
 
         XCTAssertTrue(qwenTitle.waitForNonExistence(timeout: 3))
@@ -610,6 +630,11 @@ final class ChatLLMUITests: XCTestCase {
         let delete = app.buttons["Delete"]
         XCTAssertTrue(delete.waitForExistence(timeout: 3))
         delete.tap()
+        // Deleting a chat asks first.
+        let confirm = app.alerts["Delete Chat?"].buttons["Delete"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        confirm.tap()
+        XCTAssertTrue(app.staticTexts["Web Search Preview"].waitForNonExistence(timeout: 3))
 
         // The sidebar stays open for further edits while a blank chat takes the open chat's place.
         XCTAssertTrue(app.buttons["sidebar.dismiss"].exists)
@@ -619,6 +644,121 @@ final class ChatLLMUITests: XCTestCase {
         XCTAssertTrue(app.textViews.firstMatch.waitForExistence(timeout: 5))
         XCTAssertFalse(demoMessage.exists)
         XCTAssertFalse(app.staticTexts["Select a Conversation"].exists)
+    }
+
+    @MainActor
+    func testDeletingAChatFromItsContextMenuAsksFirst() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-test-reset-app-state", "-ui-test-web-search-demo", "-ui-test-second-chat"]
+        app.launch()
+        XCTAssertTrue(app.textViews.firstMatch.waitForExistence(timeout: 5))
+
+        openSidebar(in: app)
+        let row = app.staticTexts["Second Chat"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        let confirmation = app.alerts["Delete Chat?"]
+
+        // Cancelling keeps the chat.
+        row.press(forDuration: 1.0)
+        let delete = app.buttons["Delete"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 3))
+        confirmation.buttons["Cancel"].tap()
+        XCTAssertTrue(confirmation.waitForNonExistence(timeout: 3))
+        XCTAssertTrue(row.exists)
+
+        // Confirming deletes it and leaves the other chats alone.
+        row.press(forDuration: 1.0)
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 3))
+        confirmation.buttons["Delete"].tap()
+        XCTAssertTrue(row.waitForNonExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["Web Search Preview"].exists)
+    }
+
+    @MainActor
+    func testSwipingToDeleteAChatAsksFirstEvenAfterAFullSwipe() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-test-reset-app-state", "-ui-test-web-search-demo", "-ui-test-second-chat"]
+        app.launch()
+        XCTAssertTrue(app.textViews.firstMatch.waitForExistence(timeout: 5))
+
+        openSidebar(in: app)
+        let row = app.staticTexts["Second Chat"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+
+        // A swipe across the whole row only reveals the action; nothing is deleted yet.
+        let start = row.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: -app.frame.width, dy: 0)))
+        let confirmation = app.alerts["Delete Chat?"]
+        XCTAssertFalse(confirmation.exists)
+        XCTAssertTrue(row.exists)
+
+        let delete = app.buttons["Delete"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 3))
+        confirmation.buttons["Cancel"].tap()
+        XCTAssertTrue(confirmation.waitForNonExistence(timeout: 3))
+        XCTAssertTrue(row.exists)
+    }
+
+    @MainActor
+    func testNewChatDoesNotInheritAnEditInProgress() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-test-reset-app-state", "-ui-test-web-search-demo"]
+        app.launch()
+        let messageText = "What changed in SwiftUI web views this year?"
+        let message = app.staticTexts[messageText]
+        XCTAssertTrue(message.waitForExistence(timeout: 5))
+
+        message.press(forDuration: 1.0)
+        app.buttons["Edit"].tap()
+        let composer = app.textViews.firstMatch
+        XCTAssertTrue(app.buttons["chat.edit.cancel"].waitForExistence(timeout: 3))
+        assertValue(of: composer, becomes: messageText)
+
+        openSidebar(in: app)
+        app.buttons["New Chat"].firstMatch.tap()
+        XCTAssertTrue(message.waitForNonExistence(timeout: 5))
+
+        // The new chat's composer is empty and not editing the other chat's message.
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["chat.edit.cancel"].exists)
+        XCTAssertFalse((composer.value as? String ?? "").contains(messageText))
+    }
+
+    @MainActor
+    func testComposerTextAndImageStayWithTheirChat() throws {
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "-ui-test-reset-app-state", "-ui-test-web-search-demo",
+            "-ui-test-second-chat", "-ui-test-composer-image"
+        ]
+        app.launch()
+        XCTAssertTrue(app.buttons["message.sources"].waitForExistence(timeout: 5))
+        let attachedImage = app.staticTexts["Image attached"]
+        XCTAssertTrue(attachedImage.waitForExistence(timeout: 5))
+
+        let draft = "Draft for the demo chat"
+        let composer = app.textViews.firstMatch
+        composer.tap()
+        composer.typeText(draft)
+        assertValue(of: composer, becomes: draft)
+
+        openSidebar(in: app)
+        let secondChatRow = app.staticTexts["Second Chat"]
+        XCTAssertTrue(secondChatRow.waitForExistence(timeout: 5))
+        secondChatRow.tap()
+        XCTAssertTrue(app.staticTexts["Second chat reply."].waitForExistence(timeout: 5))
+
+        // The other chat's composer starts empty: neither the text nor the image followed.
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        XCTAssertFalse((composer.value as? String ?? "").contains(draft))
+        XCTAssertFalse(attachedImage.exists)
+        XCTAssertFalse(app.buttons["Remove Image"].exists)
     }
 
     @MainActor
@@ -639,9 +779,10 @@ final class ChatLLMUITests: XCTestCase {
         confirm.tap()
 
         // The draft stays usable instead of being replaced by a dead placeholder.
-        if app.buttons["sidebar.dismiss"].waitForExistence(timeout: 3) {
-            app.buttons["sidebar.dismiss"].tap()
-        }
+        // Settings was opened from the sidebar, which is still open behind it.
+        let dismissSidebar = app.buttons["sidebar.dismiss"]
+        XCTAssertTrue(dismissSidebar.waitForExistence(timeout: 3))
+        dismissSidebar.tap()
         XCTAssertTrue(app.textViews.firstMatch.waitForExistence(timeout: 5))
         XCTAssertFalse(app.staticTexts["Start a New Chat"].exists)
     }
@@ -732,9 +873,11 @@ final class ChatLLMUITests: XCTestCase {
         app.buttons["Edit"].tap()
         XCTAssertTrue(app.buttons["chat.edit.cancel"].waitForExistence(timeout: 3))
 
-        // The title stays a plain label rather than the model menu.
+        // The title stays a plain label rather than the model menu. The tap returns
+        // once the app is idle, so a menu would already be showing.
         app.navigationBars.staticTexts["Apple Intelligence"].firstMatch.tap()
-        XCTAssertFalse(app.buttons["Manage Models"].waitForExistence(timeout: 2))
+        XCTAssertTrue(app.buttons["chat.edit.cancel"].exists)
+        XCTAssertFalse(app.buttons["Manage Models"].exists)
     }
 
     @MainActor
@@ -750,7 +893,7 @@ final class ChatLLMUITests: XCTestCase {
         XCTAssertTrue(done.waitForExistence(timeout: 3))
 
         done.tap()
-        XCTAssertFalse(done.waitForExistence(timeout: 2))
+        XCTAssertTrue(done.waitForNonExistence(timeout: 3))
         XCTAssertTrue(app.textViews.firstMatch.exists)
     }
 
@@ -810,32 +953,13 @@ final class ChatLLMUITests: XCTestCase {
     }
 
     @MainActor
-    func testImageInAMessageIsNamedForVoiceOver() throws {
+    func testAttachedImageCanBeRemovedBeforeSending() throws {
+        // The image is seeded into the composer as if just picked, so the test doesn't
+        // depend on the simulator's sample photo library.
         let app = XCUIApplication()
-        app.launchArguments = ["-ui-test-reset-app-state", "-ui-test-web-search-demo", "-ui-test-image-message"]
-        app.launch()
-
-        let image = app.buttons["Attached image"]
-        XCTAssertTrue(image.waitForExistence(timeout: 5))
-        image.tap()
-        XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 3))
-    }
-
-    @MainActor
-    func testPickedImageCanBeRemovedBeforeSending() throws {
-        let app = XCUIApplication()
-        app.launchArguments = ["-ui-test-reset-app-state", "-ui-test-web-search-demo"]
+        app.launchArguments = ["-ui-test-reset-app-state", "-ui-test-web-search-demo", "-ui-test-composer-image"]
         app.launch()
         XCTAssertTrue(app.buttons["message.sources"].waitForExistence(timeout: 5))
-
-        app.buttons["Add attachment or web search"].tap()
-        let photos = app.buttons["Photos"]
-        XCTAssertTrue(photos.waitForExistence(timeout: 3))
-        photos.tap()
-        // The simulator's sample library.
-        let photo = app.images.matching(NSPredicate(format: "label BEGINSWITH 'Photo'")).firstMatch
-        XCTAssertTrue(photo.waitForExistence(timeout: 10))
-        photo.tap()
 
         let remove = app.buttons["Remove Image"]
         XCTAssertTrue(remove.waitForExistence(timeout: 5))
@@ -912,8 +1036,10 @@ final class ChatLLMUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Edit"].exists)
     }
 
+    /// Five or more cold launches; opt in with TEST_RUNNER_CHATLLM_RUN_PERFORMANCE_TESTS=1.
     @MainActor
     func testLaunchPerformance() throws {
+        try XCTSkipUnless(Self.runsPerformanceTests, "Set TEST_RUNNER_CHATLLM_RUN_PERFORMANCE_TESTS=1 to measure launch time.")
         measure(metrics: [XCTApplicationLaunchMetric()]) {
             let app = XCUIApplication()
             app.launchArguments.append("-ui-test-reset-app-state")
@@ -939,13 +1065,48 @@ final class ChatLLMUITests: XCTestCase {
 
     @MainActor
     private func openSettings(in app: XCUIApplication) {
+        // Wait for whichever screen the launch shows instead of always waiting for onboarding.
         let skip = app.buttons["onboarding.skip"]
-        if skip.waitForExistence(timeout: 2) { skip.tap() }
+        let sidebarToggle = app.buttons["sidebar.toggle"]
+        XCTAssertTrue(waitUntil { skip.exists || sidebarToggle.exists })
+        if skip.exists { skip.tap() }
         if !app.buttons["sidebar.dismiss"].exists { openSidebar(in: app) }
         let settings = app.buttons["Settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 5))
         settings.tap()
         XCTAssertTrue(app.buttons["settings.appearance"].waitForExistence(timeout: 5))
+    }
+
+    /// Polls `condition` until it holds or `timeout` passes, returning as soon as the
+    /// app reaches the expected state instead of after a fixed wait.
+    @MainActor
+    private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else { return false }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        return true
+    }
+
+    @MainActor
+    private func assertLabel(
+        of element: XCUIElement, becomes label: String, timeout: TimeInterval = 3,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let matched = waitUntil(timeout: timeout) { element.exists && element.label == label }
+        XCTAssertTrue(matched, "Expected label \"\(label)\", found \"\(element.exists ? element.label : "no element")\"",
+                      file: file, line: line)
+    }
+
+    @MainActor
+    private func assertValue(
+        of element: XCUIElement, becomes value: String, timeout: TimeInterval = 3,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let matched = waitUntil(timeout: timeout) { element.exists && element.value as? String == value }
+        let found = element.exists ? String(describing: element.value ?? "nil") : "no element"
+        XCTAssertTrue(matched, "Expected value \"\(value)\", found \"\(found)\"", file: file, line: line)
     }
 
     @MainActor
@@ -995,7 +1156,8 @@ final class ChatLLMUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 5))
         openSettings(in: app)
         app.buttons["settings.chat"].tap()
-        XCTAssertNotEqual(app.switches["settings.sendOnReturn"].value as? String, original)
+        let changed = app.switches["settings.sendOnReturn"]
+        XCTAssertTrue(waitUntil(timeout: 3) { changed.exists && changed.value as? String != original })
     }
 
     @MainActor
@@ -1006,8 +1168,10 @@ final class ChatLLMUITests: XCTestCase {
         toggle(app.switches["settings.sendOnReturn"])
         settingsBackButton(in: app).tap()
         app.buttons["settings.done"].tap()
+        // Settings was opened from the sidebar, which is still open behind it.
         let dismissSidebar = app.buttons["sidebar.dismiss"]
-        if dismissSidebar.waitForExistence(timeout: 2) { dismissSidebar.tap() }
+        XCTAssertTrue(dismissSidebar.waitForExistence(timeout: 3))
+        dismissSidebar.tap()
 
         let composer = app.textViews.firstMatch
         XCTAssertTrue(composer.waitForExistence(timeout: 5))
@@ -1105,7 +1269,7 @@ final class ChatLLMUITests: XCTestCase {
         app.segmentedControls["settings.colorScheme"].buttons[oppositeAppearance].tap()
         captureSettingsScreenshot("appearance-dark", in: app)
         app.sliders["settings.messageTextSize"].adjust(toNormalizedSliderPosition: 1)
-        XCTAssertEqual(app.sliders["settings.messageTextSize"].value as? String, "22 points")
+        assertValue(of: app.sliders["settings.messageTextSize"], becomes: "22 points")
         settingsBackButton(in: app).tap()
         XCTAssertTrue(app.buttons["settings.appearance"].label.contains(oppositeAppearance))
         XCTAssertGreaterThan(abs(try settingsBackgroundBrightness(in: app) - systemBrightness), 100)
@@ -1114,7 +1278,7 @@ final class ChatLLMUITests: XCTestCase {
         app.buttons["settings.appearance"].tap()
         app.segmentedControls["settings.colorScheme"].buttons["System"].tap()
         app.buttons["Reset Text Size"].tap()
-        XCTAssertEqual(app.sliders["settings.messageTextSize"].value as? String, "16 points")
+        assertValue(of: app.sliders["settings.messageTextSize"], becomes: "16 points")
         captureSettingsScreenshot("appearance-light", in: app)
         settingsBackButton(in: app).tap()
         XCTAssertEqual(try settingsBackgroundBrightness(in: app), systemBrightness, accuracy: 5)
@@ -1176,15 +1340,15 @@ final class ChatLLMUITests: XCTestCase {
         app.buttons["settings.chat"].tap()
         let sendOnReturn = app.switches["settings.sendOnReturn"]
         XCTAssertTrue(sendOnReturn.waitForExistence(timeout: 3))
-        XCTAssertEqual(sendOnReturn.value as? String, "0")
+        assertValue(of: sendOnReturn, becomes: "0")
         toggle(sendOnReturn)
-        XCTAssertEqual(sendOnReturn.value as? String, "1")
+        assertValue(of: sendOnReturn, becomes: "1")
         // Terminate without Done: the toggle must already be saved.
         app.terminate()
         let relaunched = launchApp(resetAppState: false)
         openSettings(in: relaunched)
         relaunched.buttons["settings.chat"].tap()
-        XCTAssertEqual(relaunched.switches["settings.sendOnReturn"].value as? String, "1")
+        assertValue(of: relaunched.switches["settings.sendOnReturn"], becomes: "1")
     }
 
     @MainActor
@@ -1256,30 +1420,30 @@ final class ChatLLMUITests: XCTestCase {
         toggle(memory)
         XCTAssertTrue(app.alerts["Disable RAM Precautions?"].waitForExistence(timeout: 3))
         app.alerts.buttons["Cancel"].tap()
-        XCTAssertEqual(memory.value as? String, "0")
+        assertValue(of: memory, becomes: "0")
         toggle(memory)
         app.alerts.buttons["Disable"].tap()
-        XCTAssertEqual(memory.value as? String, "1")
+        assertValue(of: memory, becomes: "1")
         let fullCache = app.switches["settings.forcePersistentKVCache"]
-        XCTAssertEqual(fullCache.value as? String, "0")
+        assertValue(of: fullCache, becomes: "0")
         toggle(fullCache)
-        XCTAssertEqual(fullCache.value as? String, "1")
+        assertValue(of: fullCache, becomes: "1")
         let contextLimit = app.switches["settings.overrideContextWindowLimit"]
-        XCTAssertEqual(contextLimit.value as? String, "0")
+        assertValue(of: contextLimit, becomes: "0")
         toggle(contextLimit)
-        XCTAssertEqual(contextLimit.value as? String, "1")
+        assertValue(of: contextLimit, becomes: "1")
         settingsBackButton(in: app).tap()
         app.buttons["settings.reset"].tap()
         app.alerts.buttons["Cancel"].tap()
         app.buttons["settings.developer"].tap()
-        XCTAssertEqual(memory.value as? String, "1")
+        assertValue(of: memory, becomes: "1")
         settingsBackButton(in: app).tap()
         app.buttons["settings.reset"].tap()
         app.alerts.buttons["Reset"].tap()
         app.buttons["settings.developer"].tap()
-        XCTAssertEqual(memory.value as? String, "0")
-        XCTAssertEqual(fullCache.value as? String, "0")
-        XCTAssertEqual(contextLimit.value as? String, "0")
+        assertValue(of: memory, becomes: "0")
+        assertValue(of: fullCache, becomes: "0")
+        assertValue(of: contextLimit, becomes: "0")
     }
 
     @MainActor

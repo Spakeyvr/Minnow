@@ -7,7 +7,6 @@
 //  pairs it with a spinner.
 //
 
-import Combine
 import SwiftUI
 
 /// Just the animated text label — pair with your own spinner when you
@@ -17,18 +16,25 @@ struct LoadingDotsLabel: View {
     var font: Font = .subheadline
     var color: Color = .secondary
 
-    @State private var dotCount: Int = 1
-    private let timer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
+    static let dotInterval: TimeInterval = 0.4
+
+    /// The dot count is read off the clock rather than kept in state, so a parent
+    /// that re-renders often (a progress update, say) cannot reset or stall it.
+    /// Rounding, not truncation, keeps a timeline entry that lands a hair before
+    /// its interval from repeating the previous count.
+    static func dotCount(at date: Date) -> Int {
+        let step = Int((date.timeIntervalSinceReferenceDate / dotInterval).rounded())
+        return ((step % 3) + 3) % 3 + 1
+    }
 
     var body: some View {
-        Text("\(Text(label))\(String(repeating: ".", count: dotCount))")
-            .font(font)
-            .foregroundStyle(color)
-            .monospacedDigit()
-            .accessibilityLabel(Text(label))
-            .onReceive(timer) { _ in
-                dotCount = dotCount % 3 + 1
-            }
+        TimelineView(.periodic(from: .distantPast, by: Self.dotInterval)) { context in
+            Text("\(Text(label))\(String(repeating: ".", count: Self.dotCount(at: context.date)))")
+                .font(font)
+                .foregroundStyle(color)
+                .monospacedDigit()
+        }
+        .accessibilityLabel(Text(label))
     }
 }
 

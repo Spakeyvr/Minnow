@@ -92,16 +92,18 @@ extension MLXModelManager {
                     onProgress: { [weak self] progress in
                         Task { @MainActor [weak self] in
                             guard let self, self.activeDownloadRunID == runID else { return }
-                            self.downloadProgress = progress
+                            self.publishDownloadProgress(progress)
                         }
                     }
                 )
                 guard !Task.isCancelled, self.activeDownloadRunID == runID else { return }
-                try self.validateDownloadedModel(at: tempDir)
-                if FileManager.default.fileExists(atPath: targetDir.path) {
-                    try FileManager.default.removeItem(at: targetDir)
+                try await Self.installDownloadedPackage(from: tempDir, to: targetDir)
+                guard self.activeDownloadRunID == runID else {
+                    // Cancelled while the files were moving; they are in
+                    // place, so availability still has to reflect them.
+                    await self.refreshModelAvailabilityInBackground(changedModelID: model.id)
+                    return
                 }
-                try FileManager.default.moveItem(at: tempDir, to: targetDir)
                 self.activeDownloadRunID = nil
                 self.downloaderTask = nil
                 self.downloadProgress = 1.0
@@ -111,7 +113,8 @@ extension MLXModelManager {
                 self.defaults.removeObject(
                     forKey: Self.activeBackgroundDownloadModelIDKey
                 )
-                self.refreshModelAvailability()
+                self.removePromptPrefixEntries(forModelID: model.id)
+                await self.refreshModelAvailabilityInBackground(changedModelID: model.id)
                 self.downloadCompleted.send(model.id)
                 self.logger.notice("Model downloaded: \(model.displayName, privacy: .public)")
             } catch {
@@ -160,8 +163,10 @@ extension MLXModelManager {
         defaults.removeObject(forKey: Self.activeBackgroundDownloadModelIDKey)
         if let model {
             let modelsDir = documentsDirectory.appendingPathComponent("Models", isDirectory: true)
+            // The partial folder is deleted next, so resume data would be thrown away.
             BackgroundModelDownloadSession.shared.cancelTransfers(
-                withIDPrefix: model.hfRepoId + "/"
+                withIDPrefix: model.hfRepoId + "/",
+                preservingResumeData: false
             )
             cleanupPartialDownload(at: partialDownloadDirectory(for: model, in: modelsDir))
             cleanupLegacyPartialDownloads(for: model, in: modelsDir)
@@ -179,7 +184,34 @@ extension MLXModelManager {
         }
     }
 
-    private func validateDownloadedModel(at dir: URL) throws {
+    /// Steps the published progress in whole percents. Transfer callbacks
+    /// arrive far more often, and every published change re-renders the
+    /// views showing the download.
+    func publishDownloadProgress(_ progress: Double) {
+        let clamped = min(max(progress, 0), 1)
+        guard Self.shouldPublishDownloadProgress(clamped, previous: downloadProgress) else { return }
+        downloadProgress = clamped
+    }
+
+    nonisolated static func shouldPublishDownloadProgress(_ progress: Double, previous: Double) -> Bool {
+        let percent = (progress * 100).rounded(.down)
+        let previousPercent = (previous * 100).rounded(.down)
+        return percent != previousPercent || (progress >= 1 && previous < 1) || progress < previous
+    }
+
+    /// Validates the finished download and moves it into place off the main
+    /// actor; replacing an existing package can mean removing gigabytes.
+    @concurrent
+    nonisolated private static func installDownloadedPackage(from tempDir: URL, to targetDir: URL) async throws {
+        try validateDownloadedModel(at: tempDir)
+        let fm = FileManager.default
+        if fm.fileExists(atPath: targetDir.path) {
+            try fm.removeItem(at: targetDir)
+        }
+        try fm.moveItem(at: tempDir, to: targetDir)
+    }
+
+    nonisolated private static func validateDownloadedModel(at dir: URL) throws {
         let fm = FileManager.default
         let hasConfig = fm.fileExists(atPath: dir.appendingPathComponent("config.json").path)
         let contents = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
@@ -196,9 +228,11 @@ extension MLXModelManager {
             guard let self else { return }
 
             do {
+                // The long middle step keeps progress on screen for tests that check it.
+                let holdsProgress = !Self.isUITestFastFakeDownloadsEnabled
                 let progressSteps: [(progress: Double, delay: Duration)] = [
                     (0.2, .milliseconds(120)),
-                    (0.55, .seconds(5)),
+                    (0.55, holdsProgress ? .seconds(5) : .milliseconds(120)),
                     (1.0, .milliseconds(120))
                 ]
                 for step in progressSteps {
@@ -207,34 +241,26 @@ extension MLXModelManager {
                         throw CancellationError()
                     }
 
-                    await MainActor.run {
-                        self.downloadProgress = step.progress
-                    }
+                    self.downloadProgress = step.progress
                 }
 
-                await MainActor.run {
-                    self.simulatedDownloadedModelIDs.insert(model.id)
-                    self.isDownloading = false
-                    self.activeDownloadModelID = nil
-                    self.downloadProgress = 1.0
-                    self.downloadErrorModelID = nil
-                    self.refreshModelAvailability()
-                }
+                self.simulatedDownloadedModelIDs.insert(model.id)
+                self.isDownloading = false
+                self.activeDownloadModelID = nil
+                self.downloadProgress = 1.0
+                self.downloadErrorModelID = nil
+                self.refreshModelAvailability(changedModelID: model.id)
             } catch is CancellationError {
-                await MainActor.run {
-                    self.isDownloading = false
-                    self.activeDownloadModelID = nil
-                    self.downloadProgress = 0
-                    self.downloadError = nil
-                    self.downloadErrorModelID = nil
-                }
+                self.isDownloading = false
+                self.activeDownloadModelID = nil
+                self.downloadProgress = 0
+                self.downloadError = nil
+                self.downloadErrorModelID = nil
             } catch {
-                await MainActor.run {
-                    self.isDownloading = false
-                    self.activeDownloadModelID = nil
-                    self.downloadError = error.localizedDescription
-                    self.downloadErrorModelID = model.id
-                }
+                self.isDownloading = false
+                self.activeDownloadModelID = nil
+                self.downloadError = error.localizedDescription
+                self.downloadErrorModelID = model.id
             }
         }
     }

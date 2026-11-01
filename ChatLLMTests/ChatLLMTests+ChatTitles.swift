@@ -195,12 +195,7 @@ extension ChatLLMTests {
         title: String = "New Chat",
         turns: [(MessageRole, String, Bool)]
     ) throws -> ChatViewModel {
-        let schema = Schema([Conversation.self, ChatLLM.Message.self, MessageAttachment.self])
-        let container = try ModelContainer(
-            for: schema,
-            configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
-        )
-        let context = ModelContext(container)
+        let context = try makeContext()
         let conversation = Conversation(title: title)
         context.insert(conversation)
         conversation.messages = turns.enumerated().map { index, turn in

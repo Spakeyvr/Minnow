@@ -70,11 +70,11 @@ extension ChatLLMTests {
         viewModel.conversation.reasoningMode = false
         viewModel.conversation.smartReasoningMode = false
         #expect(testEnvironment.bridge.reasoningRequired)
-        #expect(try await viewModel.shouldUseReasoningForPrompt("Hello"))
-        #expect(await viewModel.resolvedReasoningMode(for: nil, logContext: "test"))
+        #expect(viewModel.shouldUseReasoningForPrompt("Hello"))
+        #expect(viewModel.resolvedReasoningMode(for: nil))
         testEnvironment.bridge.selectedModelID = "qwen3.5-0.8b-4bit"
         #expect(!testEnvironment.bridge.reasoningRequired)
-        #expect(try await viewModel.shouldUseReasoningForPrompt("Hello") == false)
+        #expect(viewModel.shouldUseReasoningForPrompt("Hello") == false)
     }
 
     @Test func lfmMigratedConversationKeepsItsBackendWhenReopenedBeforeDownload() throws {

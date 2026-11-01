@@ -27,11 +27,36 @@ actor FoundationModelsGate {
         waiters.remove(at: index).continuation.resume(throwing: CancellationError())
     }
 
+    /// Callers currently queued behind the holder.
+    var waiterCount: Int { waiters.count }
+
     func release() {
         if !waiters.isEmpty {
             waiters.removeFirst().continuation.resume()
         } else {
             isHeld = false
+        }
+    }
+}
+
+/// `didRelease` is only read and written under `lock`, and `gate` is an actor.
+nonisolated final class FoundationModelsGateLease: @unchecked Sendable {
+    private let gate: FoundationModelsGate
+    private let lock = NSLock()
+    private var didRelease = false
+
+    init(gate: FoundationModelsGate) {
+        self.gate = gate
+    }
+
+    func release() async {
+        let shouldRelease = lock.withLock {
+            guard !didRelease else { return false }
+            didRelease = true
+            return true
+        }
+        if shouldRelease {
+            await gate.release()
         }
     }
 }

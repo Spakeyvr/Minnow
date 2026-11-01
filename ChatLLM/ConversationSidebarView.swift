@@ -48,6 +48,12 @@ struct ConversationRow: View {
         }
     }
 
+    /// How much of a message the preview reads. The row shows one line, and the open
+    /// chat's row re-renders as its reply streams, so the cost must not grow with the reply.
+    static let previewSourceLimit = 1_000
+    /// Longest preview handed to the Markdown parser; far more than one line can show.
+    static let previewLengthLimit = 300
+
     /// The newest visible message text. Walks back from the latest message because
     /// displayText hashes the whole message, so computing it for every message on each
     /// sidebar render adds up. A reply that failed before writing anything has no text,
@@ -56,19 +62,34 @@ struct ConversationRow: View {
         let visible = conversation.messages.filter { $0.role != .system }
         // Common case: the latest message has text, so skip sorting the whole chat.
         if let latest = visible.max(by: { $0.order < $1.order }) {
-            let text = stripForPreview(latest.displayText)
+            let text = previewSnippet(from: latest.displayText)
             if !text.isEmpty { return text }
         }
         return visible
             .sorted { $0.order > $1.order }
             .dropFirst()
             .lazy
-            .map { stripForPreview($0.displayText) }
+            .map { previewSnippet(from: $0.displayText) }
             .first { !$0.isEmpty }
     }
 
+    /// The preview of one message, built from its beginning only. Falls back to the whole
+    /// text when hidden blocks fill the part that was read.
+    static func previewSnippet(from text: String) -> String {
+        guard let cutoff = text.index(text.startIndex, offsetBy: previewSourceLimit, limitedBy: text.endIndex),
+              cutoff < text.endIndex else {
+            return String(stripForPreview(text).prefix(previewLengthLimit))
+        }
+        let snippet = stripForPreview(String(text[..<cutoff]), isTruncated: true)
+        if !snippet.isEmpty {
+            return String(snippet.prefix(previewLengthLimit))
+        }
+        return String(stripForPreview(text).prefix(previewLengthLimit))
+    }
+
     // Removes <sources>…</sources>, stray <sources> tags, and <thinking>…</thinking> from preview text.
-    private static func stripForPreview(_ text: String) -> String {
+    // A truncated text may end inside a hidden block, so it is cut where that block opens.
+    private static func stripForPreview(_ text: String, isTruncated: Bool = false) -> String {
         var output = text
 
         func applying(_ regex: NSRegularExpression) {
@@ -80,6 +101,10 @@ struct ConversationRow: View {
         // Remove full blocks first
         applying(SharedRegexes.sourcesBlock)
         applying(_previewThinkingBlockRegex)
+        if isTruncated,
+           let unclosedBlock = output.range(of: #"<(?:sources|think|thinking)>"#, options: [.regularExpression, .caseInsensitive]) {
+            output = String(output[..<unclosedBlock.lowerBound])
+        }
         // Remove any stray opening/closing tags that may remain
         applying(_previewSourcesTagRegex)
         applying(_previewThinkingTagRegex)
@@ -108,7 +133,6 @@ struct ConversationRow: View {
                 Text(conversation.title.isEmpty ? String(localized: "Untitled", bundle: .appLocalized, locale: locale) : conversation.title)
                     .font(.body.weight(.semibold))
                     .lineLimit(1)
-                    .accessibilityAddTraits(.isHeader)
 
                 if Self.showsReasoningBadge(for: conversation) {
                     Image(systemName: "brain.head.profile")
@@ -151,11 +175,55 @@ extension ConversationSidebar: Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.hasConversations == rhs.hasConversations
             && lhs.selectedID == rhs.selectedID
-            && lhs.shape == rhs.shape
+            && lhs.sections.map(\.id) == rhs.sections.map(\.id)
+            && lhs.sections.map { $0.conversations.map(\.id) } == rhs.sections.map { $0.conversations.map(\.id) }
+    }
+}
+
+// MARK: - Cached Sections
+
+/// The sidebar's filtered, recency-grouped chats, recomputed only when the list, a chat's
+/// title or activity date, the search, or the day changes. ContentView renders several
+/// times a second while a reply streams, and searching reads every message of every chat.
+final class SidebarSectionsCache {
+    private struct Entry: Equatable {
+        let id: UUID
+        let title: String
+        let lastUpdated: Date
     }
 
-    private var shape: [[String]] {
-        sections.map { [$0.id] + $0.conversations.map(\.id.uuidString) }
+    private struct Key: Equatable {
+        let entries: [Entry]
+        let searchTerms: [String]
+        let day: Date
+    }
+
+    private var key: Key?
+    private var cachedSections: [ConversationRecencySection] = []
+    private(set) var computeCount = 0
+
+    func sections(
+        for conversations: [Conversation],
+        searchTerms: [String],
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> [ConversationRecencySection] {
+        // A new message updates lastUpdated, so the key also notices message text that
+        // a search could now match.
+        let key = Key(
+            entries: conversations.map { Entry(id: $0.id, title: $0.title, lastUpdated: $0.lastUpdated) },
+            searchTerms: searchTerms,
+            day: calendar.startOfDay(for: now)
+        )
+        if key == self.key { return cachedSections }
+
+        let matching = searchTerms.isEmpty
+            ? conversations
+            : conversations.filter { $0.matchesSearch(searchTerms) }
+        cachedSections = ConversationRecencySection.grouping(matching, now: now, calendar: calendar)
+        self.key = key
+        computeCount += 1
+        return cachedSections
     }
 }
 
@@ -222,7 +290,19 @@ struct ConversationSidebar: View {
     let onNewChat: () -> Void
     let onShowSettings: () -> Void
     let onRename: (Conversation) -> Void
+    /// Deletes a chat the user has confirmed deleting.
     let onDelete: (Conversation) -> Void
+
+    /// The chat whose Delete is waiting for confirmation. Deleting removes the chat and
+    /// its attachment files for good, so neither a stray swipe nor the menu does it alone.
+    @State private var conversationPendingDeletion: Conversation?
+
+    private var isDeleteConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { conversationPendingDeletion != nil },
+            set: { if !$0 { conversationPendingDeletion = nil } }
+        )
+    }
 
     var body: some View {
         List(selection: $selection) {
@@ -262,6 +342,18 @@ struct ConversationSidebar: View {
         )
         .searchToolbarBehavior(.minimize)
         .onSubmit(of: .search, onSubmitSearch)
+        .alert(
+            "Delete Chat?",
+            isPresented: isDeleteConfirmationPresented,
+            presenting: conversationPendingDeletion
+        ) { convo in
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                onDelete(convo)
+            }
+        } message: { _ in
+            Text("This chat and its attachments will be permanently deleted. This cannot be undone.")
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button(action: onShowSettings) {
@@ -316,17 +408,20 @@ struct ConversationSidebar: View {
                 }
 
                 Button(role: .destructive) {
-                    onDelete(convo)
+                    conversationPendingDeletion = convo
                 } label: {
                     Label("Delete", systemImage: "trash")
                 }
             }
-            .swipeActions(edge: .trailing) {
-                Button(role: .destructive) {
-                    onDelete(convo)
+            // No full swipe and no destructive role: either would slide the row away
+            // before the user has confirmed.
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button {
+                    conversationPendingDeletion = convo
                 } label: {
                     Label("Delete", systemImage: "trash")
                 }
+                .tint(.red)
             }
     }
 

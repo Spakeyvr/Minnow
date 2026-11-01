@@ -42,16 +42,20 @@ extension ChatViewModel {
         referenceDate: Date = Date(),
         timeZone: TimeZone = .current
     ) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = timeZone
-        formatter.dateFormat = "EEEE, MMMM d, yyyy 'at' HH:mm"
+        // A format style rather than a `DateFormatter`: Foundation caches the
+        // formatter behind it instead of building one on every prompt.
+        let style = Date.VerbatimFormatStyle(
+            format: "\(weekday: .wide), \(month: .wide) \(day: .defaultDigits), \(year: .defaultDigits) at \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)",
+            locale: Locale(identifier: "en_US_POSIX"),
+            timeZone: timeZone,
+            calendar: Calendar(identifier: .gregorian)
+        )
         let timeZoneLabel: String = if timeZone.secondsFromGMT(for: referenceDate) == 0 {
             "UTC"
         } else {
             timeZone.abbreviation(for: referenceDate) ?? timeZone.identifier
         }
-        let formatted = formatter.string(from: referenceDate) + " " + timeZoneLabel
+        let formatted = referenceDate.formatted(style) + " " + timeZoneLabel
         return """
         Current date and time: \(formatted)
         - Treat this timestamp as the current moment for time-sensitive requests and web searches.
@@ -140,12 +144,20 @@ extension ChatViewModel {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var trimmedChatPreferences: String {
+        conversation.chatPreferences.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func userTextApplyingChatPreferences(
         _ text: String,
         isLatestUserMessage: Bool
     ) -> String {
-        let preferences = conversation.chatPreferences.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isLatestUserMessage, !preferences.isEmpty else { return text }
+        guard isLatestUserMessage else { return text }
+        return Self.textApplyingChatPreferences(text, preferences: trimmedChatPreferences)
+    }
+
+    private static func textApplyingChatPreferences(_ text: String, preferences: String) -> String {
+        guard !preferences.isEmpty else { return text }
 
         return """
         User preferences for this response:
@@ -202,7 +214,7 @@ extension ChatViewModel {
         let bridge = backendBridge
         let model = bridge.selectedModelID.flatMap { bridge.modelManager?.model(withID: $0) } ??
             bridge.modelManager?.currentModel
-        let deviceMaximum = MLXDeviceSupportProfile.current.maxContextWindowTokens(for: model)
+        let deviceMaximum = MLXDeviceSupportProfile.current(defaults: defaults).maxContextWindowTokens(for: model)
         return defaults.mlxContextWindowTokens(deviceMaximum: deviceMaximum)
     }
 
@@ -219,19 +231,49 @@ extension ChatViewModel {
     }
 
     /// Newest-first prompt candidates: the most recent `maxContextMessages`
-    /// snapshots, excluding system prompts, unfinished or failed assistant
-    /// turns, and blank messages.
+    /// snapshots that can go into a prompt. System prompts, unfinished or
+    /// failed assistant turns, and blank messages are skipped before the limit
+    /// applies, so they do not take the place of real turns.
     private func promptCandidates(
         from snapshots: [MessageSnapshot],
         maxMessages: Int?
     ) -> [MessageSnapshot] {
-        let limit = min(maxMessages ?? Self.maxContextMessages, Self.maxContextMessages)
-        return snapshots.suffix(limit).reversed().filter { snapshot in
+        Array(eligiblePromptSnapshots(from: snapshots).prefix(Self.contextMessageLimit(maxMessages)))
+    }
+
+    private static func contextMessageLimit(_ maxMessages: Int?) -> Int {
+        min(maxMessages ?? maxContextMessages, maxContextMessages)
+    }
+
+    /// Every snapshot that can go into a prompt, newest first.
+    private func eligiblePromptSnapshots(from snapshots: [MessageSnapshot]) -> [MessageSnapshot] {
+        snapshots.reversed().filter { snapshot in
             guard snapshot.role != .system else { return false }
             if snapshot.role == .assistant && !snapshot.isFinal { return false }
             if Self.isFailedGenerationPlaceholder(snapshot) { return false }
             return !snapshot.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
+    }
+
+    /// How many messages the oldest end of an MLX history window moves by at a time.
+    /// A third of the message cap, so a long chat keeps most of its context.
+    nonisolated static func mlxHistoryWindowChunk(forMessageLimit limit: Int) -> Int {
+        max(4, (limit / 3) & ~1)
+    }
+
+    /// How many of the newest `total` eligible messages an MLX prompt keeps when only
+    /// the newest `fitting` fit the message cap and token budget. Dropping the oldest
+    /// message every turn would shift the history each time, so the persistent session
+    /// (which holds an earlier prefix of it) could never be reused once a chat is long.
+    /// Instead the window's start moves in steps of `chunk` messages, counted from the
+    /// start of the chat, and stays put between steps. Never keeps more than `fitting`.
+    nonisolated static func stableHistoryWindowCount(total: Int, fitting: Int, chunk: Int) -> Int {
+        guard fitting < total, chunk > 1 else { return min(fitting, total) }
+        let dropped = total - fitting
+        let alignedDrop = (dropped + chunk - 1) / chunk * chunk
+        // Always keep the latest message.
+        guard alignedDrop < total else { return fitting }
+        return total - alignedDrop
     }
 
     /// Tokens left for conversation turns once the Apple model's reply,
@@ -260,7 +302,7 @@ extension ChatViewModel {
 
         for snapshot in promptCandidates(from: snapshots, maxMessages: nil) {
             let imageURLs = snapshot.role == .user
-                ? Array(Self.readableImageURLs(in: snapshot).suffix(remainingImages))
+                ? Self.readableImageURLs(in: snapshot, limit: remainingImages)
                 : []
             let estimatedTokens = estimatedPromptTokenCost(for: snapshot)
                 + imageURLs.count * Self.foundationImageTokenEstimate
@@ -284,21 +326,53 @@ extension ChatViewModel {
         return (Array(keptSnapshots.reversed()), imageURLsByOrder)
     }
 
-    private static func readableImageURLs(in snapshot: MessageSnapshot) -> [URL] {
-        snapshot.attachments
-            .filter { $0.type == .image && FileManager.default.fileExists(atPath: $0.actualFileURL.path) }
-            .map(\.actualFileURL)
+    /// The newest `limit` image attachments of `snapshot` still on disk, in
+    /// attachment order. Only the files that can still be sent are checked.
+    private static func readableImageURLs(in snapshot: MessageSnapshot, limit: Int) -> [URL] {
+        guard limit > 0 else { return [] }
+        var urls: [URL] = []
+        for attachment in snapshot.attachments.reversed() where attachment.type == .image {
+            guard FileManager.default.fileExists(atPath: attachment.actualFileURL.path) else { continue }
+            urls.append(attachment.actualFileURL)
+            if urls.count == limit { break }
+        }
+        return urls.reversed()
+    }
+
+    /// Room in the MLX prompt for an image the latest turn sends as pixels.
+    static let mlxImageTokenEstimate = 256
+    /// Room for the tool schema and calling instructions the chat template
+    /// adds to the system turn when web search is available.
+    static let mlxToolSchemaTokenEstimate = 512
+
+    /// Tokens left for conversation turns once the MLX prompt's fixed parts
+    /// have room: the system prompt, the tool schema, the context added to the
+    /// latest turn, and the images it sends.
+    static func mlxHistoryTokenBudget(
+        promptBudget: Int,
+        systemPromptTokens: Int,
+        toolsAvailable: Bool,
+        latestTurnContextTokens: Int,
+        imageCount: Int
+    ) -> Int {
+        max(
+            minimumPromptBudgetTokens,
+            promptBudget
+                - systemPromptTokens
+                - (toolsAvailable ? mlxToolSchemaTokenEstimate : 0)
+                - latestTurnContextTokens
+                - imageCount * mlxImageTokenEstimate
+        )
     }
 
     private func trimmedSnapshotsForMLXPrompt(
-        from snapshots: [MessageSnapshot],
-        maxMessages: Int?
+        candidates: [MessageSnapshot],
+        tokenBudget: Int
     ) async -> [MessageSnapshot] {
-        let tokenBudget = effectivePromptBudgetTokenLimit()
         var keptSnapshots: [MessageSnapshot] = []
         var usedTokens = 0
 
-        for snapshot in promptCandidates(from: snapshots, maxMessages: maxMessages) {
+        for snapshot in candidates {
             let estimatedTokens = await tokenizerAwarePromptTokenCost(for: snapshot)
             if usedTokens + estimatedTokens > tokenBudget && !keptSnapshots.isEmpty {
                 break
@@ -334,19 +408,17 @@ extension ChatViewModel {
         case .user:
             chatRole = .user
         }
-        let tokenizedContentTokenCount: Int?
-        if let modelManager = backendBridge.modelManager {
-            tokenizedContentTokenCount = await modelManager.tokenCountForLoadedModelText(
-                role: chatRole,
-                content: content
-            )
-        } else {
-            tokenizedContentTokenCount = nil
-        }
         return Self.promptTokenCost(
-            tokenizedContentTokenCount: tokenizedContentTokenCount,
+            tokenizedContentTokenCount: await loadedModelTokenCount(role: chatRole, content: content),
             fallbackContent: content
         )
+    }
+
+    /// Tokens the loaded MLX model's tokenizer counts for `content`, or nil
+    /// when no model is loaded.
+    private func loadedModelTokenCount(role: Chat.Message.Role, content: String) async -> Int? {
+        guard let modelManager = backendBridge.modelManager else { return nil }
+        return await modelManager.tokenCountForLoadedModelText(role: role, content: content)
     }
 
     private func estimatedPromptTokenCost(
@@ -403,10 +475,11 @@ extension ChatViewModel {
         let allSnapshots = messageSnapshots(upToOrderExclusive: maxOrderExclusive)
 
         // Determine whether this response should use reasoning mode.
-        // When explicitly passed (e.g. regeneration), honour that value;
-        // otherwise fall back to the conversation-level toggles.
+        // When explicitly passed (as the stream does, from its reply), honour that value;
+        // otherwise decide for the latest user message the way a send does, so smart
+        // reasoning alone doesn't turn reasoning on for a prompt that doesn't need it.
         let reasoningActive = currentReasoningActive
-            ?? (conversation.reasoningMode || conversation.smartReasoningMode)
+            ?? shouldUseReasoningForPrompt(allSnapshots.last(where: { $0.role == .user })?.text)
 
         // Static prefix first (stable across turns → friendly to KV-cache reuse),
         // volatile datetime appended last.
@@ -475,7 +548,7 @@ extension ChatViewModel {
         )
     }
 
-    // MARK: - Qwen3.5 Message Builder (MLX)
+    // MARK: - MLX Message Builder
 
     internal static func shouldInjectMLXCurrentDateTimeContext(
         latestUserText: String?,
@@ -486,19 +559,17 @@ extension ChatViewModel {
         let normalized = latestUserText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? ""
-        let containsPhrase: (String) -> Bool = { phrase in
-            SharedRegexes.containsWholePhrase(phrase, in: normalized)
-        }
 
         guard !normalized.isEmpty else {
             return forceWebSearch
         }
 
-        if mlxTimeSensitiveKeywords.contains(where: { containsPhrase($0) }) {
+        // Each list is one cached alternation regex, so each check is a single scan.
+        if SharedRegexes.containsAnyWholePhrase(mlxTimeSensitiveKeywords, in: normalized) {
             return true
         }
 
-        if timeSensitiveYearTokens(referenceDate: referenceDate).contains(where: { containsPhrase($0) }) {
+        if SharedRegexes.containsAnyWholePhrase(timeSensitiveYearTokens(referenceDate: referenceDate), in: normalized) {
             return true
         }
 
@@ -506,33 +577,66 @@ extension ChatViewModel {
             return true
         }
 
-        return webSearchEnabled && mlxExplicitSearchIntentKeywords.contains(where: { containsPhrase($0) })
+        return webSearchEnabled
+            && SharedRegexes.containsAnyWholePhrase(mlxExplicitSearchIntentKeywords, in: normalized)
     }
 
+    /// The MLX system prompt, which must stay the same for the whole
+    /// conversation: it is part of the persistent session's key and bounds the
+    /// cached prompt prefix. Anything that changes from one turn to the next
+    /// belongs in `mlxTurnContext` instead.
     internal static func buildMLXSystemPrompt(
         modelIdentity: String,
-        includeCurrentDateTime: Bool,
-        webSearchEnabled: Bool,
-        forceWebSearch: Bool
+        webSearchEnabled: Bool
     ) -> String {
-        // Static prefix first (stable across turns → friendly to KV-cache reuse),
-        // volatile datetime appended last.
         var systemPrompt = baseSystemPrompt(modelIdentity: modelIdentity)
         if webSearchEnabled {
             systemPrompt += "\n\n" + webSearchSystemPrompt(
                 reasoningEnabled: false,
-                forceSearchRequired: forceWebSearch
+                forceSearchRequired: false
             )
-        }
-        if includeCurrentDateTime {
-            systemPrompt += "\n\n" + currentDateTimeContext()
         }
         return systemPrompt
     }
 
+    /// Context for this request only, sent with the latest user turn: the
+    /// current date for time-sensitive requests and the instruction to search
+    /// when a search is required. Older turns are replayed without it.
+    internal static func mlxTurnContext(
+        includeCurrentDateTime: Bool,
+        forceWebSearch: Bool,
+        referenceDate: Date = Date()
+    ) -> String? {
+        var sections: [String] = []
+        if includeCurrentDateTime {
+            sections.append(currentDateTimeContext(referenceDate: referenceDate))
+        }
+        if forceWebSearch {
+            sections.append((["Web search for this request:"] + webSearchForcedRequestLines).joined(separator: "\n"))
+        }
+        return sections.isEmpty ? nil : sections.joined(separator: "\n\n")
+    }
+
+    /// The latest user turn as MLX receives it: this request's context first,
+    /// then the chat preferences, then what the user wrote.
+    internal static func mlxLatestUserContent(
+        text: String,
+        preferences: String,
+        turnContext: String?
+    ) -> String {
+        guard let turnContext else {
+            return textApplyingChatPreferences(text, preferences: preferences)
+        }
+        let request = preferences.isEmpty
+            ? "User request:\n\(text)"
+            : textApplyingChatPreferences(text, preferences: preferences)
+        return turnContext + "\n\n" + request
+    }
+
     private func nativeImageInputs(from attachments: [AttachmentSnapshot]) async throws -> [UserInput.Image] {
         var inputs: [UserInput.Image] = []
-        var warnedForPreparationFailure = false
+        // Each telemetry line costs two image reads, so it is Developer Mode only.
+        let logsTelemetry = defaults.bool(forKey: AppSettingsKeys.developerModeEnabled)
 
         for attachment in attachments where attachment.type == .image {
             let canonicalURL = attachment.actualFileURL
@@ -541,19 +645,17 @@ extension ChatViewModel {
                 continue
             }
 
+            let inferenceURL: URL
             do {
-                let inferenceURL = try await ImageStore.shared.saveInferenceVariant(
-                    from: canonicalURL
-                )
-                await logNativeImageTelemetry(canonicalURL: canonicalURL, inferenceURL: inferenceURL)
-                inputs.append(.url(inferenceURL))
+                inferenceURL = try await ImageStore.shared.saveInferenceVariant(from: canonicalURL)
             } catch {
-                if !warnedForPreparationFailure {
-                    warnedForPreparationFailure = true
-                    logger.warning("Native image preprocessing failed before generation. Error: \(error.localizedDescription, privacy: .public)")
-                }
+                logger.warning("Native image preprocessing failed before generation. Error: \(error.localizedDescription, privacy: .public)")
                 throw error
             }
+            if logsTelemetry {
+                await logNativeImageTelemetry(canonicalURL: canonicalURL, inferenceURL: inferenceURL)
+            }
+            inputs.append(.url(inferenceURL))
         }
 
         return inputs
@@ -576,38 +678,23 @@ extension ChatViewModel {
         logger.info("Native image telemetry canonical=\(canonicalMetrics.width)x\(canonicalMetrics.height) (\(canonicalSize, privacy: .public)) inference=\(inferenceMetrics.width)x\(inferenceMetrics.height) (\(inferenceSize, privacy: .public))")
     }
 
-    /// Messages for an MLX request plus the leading part of the system prompt
-    /// that stays identical across requests, which bounds prompt-prefix caching.
+    /// Messages for an MLX request plus the part of the system prompt that
+    /// stays identical across requests, which bounds prompt-prefix caching.
+    /// The MLX system prompt no longer carries per-turn content, so this is
+    /// the whole system message.
     struct MLXPromptMessages {
         let messages: [Chat.Message]
         let stableSystemPrompt: String
     }
 
-    func buildQwenMessages(
-        upToOrderExclusive maxOrderExclusive: Int,
-        modelIdentity: String = "MLX model",
-        additionalInstruction: String? = nil,
-        includeLatestUserImages: Bool = true,
-        maxMessages: Int? = nil,
-        toolsAvailable: Bool = false,
-        forceWebSearch: Bool = false
-    ) async throws -> [Chat.Message] {
-        try await buildQwenPrompt(
-            upToOrderExclusive: maxOrderExclusive,
-            modelIdentity: modelIdentity,
-            additionalInstruction: additionalInstruction,
-            includeLatestUserImages: includeLatestUserImages,
-            maxMessages: maxMessages,
-            toolsAvailable: toolsAvailable,
-            forceWebSearch: forceWebSearch
-        ).messages
-    }
-
-    /// Builds a structured message array for the Qwen3.5 VLM processor.
-    /// The processor's `applyChatTemplate` applies the Jinja template with `add_generation_prompt=true`.
-    /// Thinking mode is controlled by the caller via `additionalContext: ["enable_thinking": false]`
-    /// — NOT through any manual prefix here.
-    func buildQwenPrompt(
+    /// Builds the structured message array for an MLX model's processor, which
+    /// applies the model's chat template with `add_generation_prompt=true`.
+    ///
+    /// Every turn but the latest is replayed exactly as earlier requests sent
+    /// it, so the persistent session can recognise the conversation it holds.
+    /// The latest user turn also carries this request's context and the chat
+    /// preferences, and a regeneration instruction is appended to it.
+    func buildMLXPrompt(
         upToOrderExclusive maxOrderExclusive: Int,
         modelIdentity: String = "MLX model",
         additionalInstruction: String? = nil,
@@ -617,79 +704,96 @@ extension ChatViewModel {
         forceWebSearch: Bool = false
     ) async throws -> MLXPromptMessages {
         let allSnapshots = messageSnapshots(upToOrderExclusive: maxOrderExclusive)
-        let snapshots = await trimmedSnapshotsForMLXPrompt(
-            from: allSnapshots,
-            maxMessages: maxMessages
-        )
-        let latestUserOrder = snapshots
-            .filter { $0.role == .user && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .map(\.order)
-            .max()
-        let latestUserText = snapshots
-            .filter { $0.role == .user && $0.order == latestUserOrder }
-            .map(\.text)
-            .last
+        let eligible = eligiblePromptSnapshots(from: allSnapshots)
+        let messageLimit = Self.contextMessageLimit(maxMessages)
+        let candidates = Array(eligible.prefix(messageLimit))
+        let latestUser = candidates.first { $0.role == .user }
 
-        let includeCurrentDateTime = Self.shouldInjectMLXCurrentDateTimeContext(
-            latestUserText: latestUserText,
-            forceWebSearch: forceWebSearch,
+        // The tokenizer chat template already injects the exact MLX tool-call
+        // syntax for the active package. Duplicating it here risks
+        // contradicting the installed template and suppressing tool use.
+        var systemPrompt = Self.buildMLXSystemPrompt(
+            modelIdentity: modelIdentity,
             webSearchEnabled: toolsAvailable
         )
-        let systemPrompt = Self.buildMLXSystemPrompt(
-            modelIdentity: modelIdentity,
-            includeCurrentDateTime: includeCurrentDateTime,
-            webSearchEnabled: toolsAvailable,
-            forceWebSearch: forceWebSearch
-        )
-        let effectiveSystemPrompt: String
         if let customSystemPrompt = customSystemPromptText(from: allSnapshots) {
-            effectiveSystemPrompt = systemPrompt + "\n\n" + customSystemPrompt
-        } else {
-            effectiveSystemPrompt = systemPrompt
+            systemPrompt += "\n\n" + customSystemPrompt
         }
-        // The date line changes every minute, so a prompt that carries it can
-        // only share the part before it with other requests.
-        let stableSystemPrompt = includeCurrentDateTime
-            ? Self.buildMLXSystemPrompt(
-                modelIdentity: modelIdentity,
-                includeCurrentDateTime: false,
-                webSearchEnabled: toolsAvailable,
-                forceWebSearch: forceWebSearch
+
+        let turnContext = Self.mlxTurnContext(
+            includeCurrentDateTime: Self.shouldInjectMLXCurrentDateTimeContext(
+                latestUserText: latestUser?.text,
+                forceWebSearch: forceWebSearch,
+                webSearchEnabled: toolsAvailable
+            ),
+            forceWebSearch: toolsAvailable && forceWebSearch
+        )
+        let latestUserText = latestUser.map(promptUserText(for:))
+        let latestUserContent = latestUserText.map {
+            Self.mlxLatestUserContent(
+                text: $0,
+                preferences: trimmedChatPreferences,
+                turnContext: turnContext
             )
-            : effectiveSystemPrompt
-        // The tokenizer chat template already injects the exact MLX tool-call
-        // syntax for the active Qwen package. Duplicating it here risks
-        // contradicting the installed template and suppressing tool use.
+        }
+        let instruction = additionalInstruction.flatMap { $0.isEmpty ? nil : $0 }
 
-        var messages: [Chat.Message] = []
-        messages.append(.system(effectiveSystemPrompt))
+        // Turns are budgeted by their plain text; what the latest turn adds on
+        // top, and the parts of the prompt that are not turns, come off first.
+        let addedLatestTurnText = Self.heuristicPromptTokenCount(for: latestUserContent ?? "")
+            - Self.heuristicPromptTokenCount(for: latestUserText ?? "")
+        let systemPromptTokens = await loadedModelTokenCount(role: .system, content: systemPrompt)
+            ?? Self.heuristicPromptTokenCount(for: systemPrompt)
+        let latestImageCount = includeLatestUserImages
+            ? (latestUser?.attachments.filter { $0.type == .image }.count ?? 0)
+            : 0
+        let historyBudget = Self.mlxHistoryTokenBudget(
+            promptBudget: effectivePromptBudgetTokenLimit(),
+            systemPromptTokens: systemPromptTokens,
+            toolsAvailable: toolsAvailable,
+            latestTurnContextTokens: max(0, addedLatestTurnText)
+                + (instruction.map { Self.heuristicPromptTokenCount(for: $0) } ?? 0),
+            imageCount: latestImageCount
+        )
+        let fittingSnapshots = await trimmedSnapshotsForMLXPrompt(
+            candidates: candidates,
+            tokenBudget: historyBudget
+        )
+        let snapshots = fittingSnapshots.suffix(Self.stableHistoryWindowCount(
+            total: eligible.count,
+            fitting: fittingSnapshots.count,
+            chunk: Self.mlxHistoryWindowChunk(forMessageLimit: messageLimit)
+        ))
 
+        var messages: [Chat.Message] = [.system(systemPrompt)]
         for msg in snapshots {
             switch msg.role {
             case .system:
                 break
             case .user:
-                let includeImages = includeLatestUserImages && msg.order == latestUserOrder
+                let isLatestUser = msg.order == latestUser?.order
+                let includeImages = includeLatestUserImages && isLatestUser
                 let images = includeImages ? (try await nativeImageInputs(from: msg.attachments)) : []
-                let userTextWithPreferences = userTextApplyingChatPreferences(
-                    promptUserText(for: msg),
-                    isLatestUserMessage: msg.order == latestUserOrder
-                )
-                messages.append(.user(userTextWithPreferences, images: images))
+                let content = isLatestUser
+                    ? (latestUserContent ?? promptUserText(for: msg))
+                    : promptUserText(for: msg)
+                messages.append(.user(content, images: images))
             case .assistant:
                 messages.append(.assistant(assistantContent(of: msg).removingSourcesBlocks()))
             }
         }
 
-        if let instruction = additionalInstruction, !instruction.isEmpty {
-            if forceWebSearch, let lastIndex = messages.indices.last, messages[lastIndex].role == .user {
+        // Merged into the user turn, as the Apple path does, rather than sent
+        // as a second consecutive user message.
+        if let instruction {
+            if let lastIndex = messages.indices.last, messages[lastIndex].role == .user {
                 messages[lastIndex].content += "\n\n" + instruction
             } else {
                 messages.append(.user(instruction))
             }
         }
 
-        return MLXPromptMessages(messages: messages, stableSystemPrompt: stableSystemPrompt)
+        return MLXPromptMessages(messages: messages, stableSystemPrompt: systemPrompt)
     }
 
     // MARK: - Static Prompts
@@ -705,6 +809,11 @@ extension ChatViewModel {
         """
     }
 
+    private static let webSearchForcedRequestLines = [
+        "- This request explicitly requires web search, so you must call webSearch before answering.",
+        "- Do not answer from memory before using the tool."
+    ]
+
     internal static func webSearchSystemPrompt(reasoningEnabled: Bool, forceSearchRequired: Bool) -> String {
         let currentYear = Calendar.current.component(.year, from: Date())
         let maxSearches = AppWebSearchToolBridge.maxInvocations
@@ -718,8 +827,7 @@ extension ChatViewModel {
         ]
 
         if forceSearchRequired {
-            lines.append("- This request explicitly requires web search, so you must call webSearch before answering.")
-            lines.append("- Do not answer from memory before using the tool.")
+            lines.append(contentsOf: webSearchForcedRequestLines)
         }
 
         if reasoningEnabled {

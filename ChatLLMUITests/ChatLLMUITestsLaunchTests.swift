@@ -7,10 +7,13 @@
 
 import XCTest
 
+/// Launch screenshots in every appearance and orientation. The normal run already
+/// checks the launch screen (testFreshLaunchShowsOnboarding), so these repeated
+/// launches run only with TEST_RUNNER_CHATLLM_RUN_PERFORMANCE_TESTS=1.
 final class ChatLLMUITestsLaunchTests: XCTestCase {
 
     override class var runsForEachTargetApplicationUIConfiguration: Bool {
-        true
+        ChatLLMUITests.runsPerformanceTests
     }
 
     override func setUpWithError() throws {
@@ -19,6 +22,7 @@ final class ChatLLMUITestsLaunchTests: XCTestCase {
 
     @MainActor
     func testLaunch() throws {
+        try XCTSkipUnless(ChatLLMUITests.runsPerformanceTests, "Set TEST_RUNNER_CHATLLM_RUN_PERFORMANCE_TESTS=1 for launch screenshots.")
         let app = XCUIApplication()
         app.launchArguments.append("-ui-test-reset-app-state")
         app.launch()

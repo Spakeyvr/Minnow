@@ -72,7 +72,7 @@ extension ChatLLMTests {
         #expect(!TavilySearchService.isLiveQuery("historia de los puentes"))
     }
 
-    @Test func tavilyKeyValidationIgnoresCancelledRequestCompletion() async {
+    @Test func tavilyKeyValidationIgnoresCancelledRequestCompletion() async throws {
         let gate = TavilyValidationGate()
         let model = TavilyKeyValidationModel { key in
             await gate.suspend(key)
@@ -88,15 +88,13 @@ extension ChatLLMTests {
         await gate.waitUntilStarted("new-key")
 
         await gate.resume("new-key")
-        for _ in 0..<20 where model.status != .valid {
-            await Task.yield()
-        }
-        #expect(model.status == .valid)
+        try await waitUntil { model.status == .valid }
 
+        // The stale request now completes with an error, which must not replace the result.
         await gate.resume("old-key")
-        for _ in 0..<20 {
-            await Task.yield()
-        }
+        await gate.waitUntilFinished("old-key")
+        await drainMainQueue()
+        await drainMainQueue()
         #expect(model.status == .valid)
     }
 

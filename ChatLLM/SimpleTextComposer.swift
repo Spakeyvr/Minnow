@@ -60,30 +60,30 @@ struct SimpleTextComposer: View {
 
     @State private var isTextViewFocused = false
     @State private var showAddSheet = false
-    @State private var composerHeight: CGFloat = 24
 
     private let circleSize: CGFloat = 44
     private let pillMinHeight: CGFloat = 44
+    /// Half the minimum height, so a one-line composer is a capsule; taller
+    /// composers keep the same radius.
+    private let pillCornerRadius: CGFloat = 22
     private let pillHorizontalPadding: CGFloat = 10
     private let maxTextViewHeight: CGFloat = 112
-    @State private var measuredPillHeight: CGFloat = 44
 
     var body: some View {
         GlassEffectContainer(spacing: 10.0) {
             VStack(spacing: 0) {
                 // Text field area
                 ZStack(alignment: .topLeading) {
+                    // Sizes itself from the proposed width (see `sizeThatFits`).
                     ComposerTextView(
                         text: $text,
                         isFocused: $isTextViewFocused,
-                        measuredHeight: $composerHeight,
                         sendOnReturn: sendOnReturn,
                         canSend: canSend,
                         isGenerating: isGenerating,
                         maxHeight: maxTextViewHeight,
                         onSend: onSend
                     )
-                    .frame(height: max(24, composerHeight))
 
                     // Same font as the text view, so typing doesn't shrink the text. Hide it
                     // as soon as anything is typed, or it would overlap a leading newline.
@@ -175,38 +175,15 @@ struct SimpleTextComposer: View {
                 .padding(.bottom, 6)
             }
             .frame(maxWidth: .infinity, minHeight: pillMinHeight)
-            .overlay(alignment: .topLeading) {
-                GeometryReader { geo in
-                    Color.clear
-                        .preference(key: PillHeightKey.self, value: geo.size.height)
-                }
-            }
-            .onPreferenceChange(PillHeightKey.self) { newHeight in
-                if abs(measuredPillHeight - newHeight) > 0.5 {
-                    measuredPillHeight = newHeight
-                }
-            }
             .glassEffect(
                 .regular.interactive(),
-                in: .rect(cornerRadius: adaptiveCornerRadius(for: measuredPillHeight))
+                in: .rect(cornerRadius: pillCornerRadius)
             )
-            .clipShape(
-                RoundedRectangle(
-                    cornerRadius: adaptiveCornerRadius(for: measuredPillHeight),
-                    style: .continuous
-                )
-            )
+            .clipShape(RoundedRectangle(cornerRadius: pillCornerRadius, style: .continuous))
         }
         .onChange(of: focusRequest) {
             isTextViewFocused = true
         }
-    }
-
-    private func adaptiveCornerRadius(for height: CGFloat) -> CGFloat {
-        let maxRadius = pillMinHeight / 2
-        let minRadius: CGFloat = 22
-        let ratio = max(0.0, min(1.0, pillMinHeight / max(height, 1)))
-        return minRadius + (maxRadius - minRadius) * ratio
     }
 }
 
@@ -217,13 +194,6 @@ private struct SubtleGlassButtonStyle: ButtonStyle {
                 configuration.isPressed ? .regular : .identity,
                 in: .circle
             )
-    }
-}
-
-private struct PillHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 44
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
     }
 }
 
@@ -445,7 +415,6 @@ private struct AttachTile: View {
 struct ComposerTextView: UIViewRepresentable {
     @Binding var text: String
     @Binding var isFocused: Bool
-    @Binding var measuredHeight: CGFloat
 
     let sendOnReturn: Bool
     let canSend: Bool
@@ -454,6 +423,17 @@ struct ComposerTextView: UIViewRepresentable {
     let onSend: () -> Void
 
     private var returnKeyType: UIReturnKeyType { sendOnReturn ? .send : .default }
+
+    /// The smallest height, one line of body text.
+    static let minimumHeight: CGFloat = 24
+
+    /// The height for `text` laid out at `width`, capped at `maxHeight`, and
+    /// whether the text overflows that cap and must scroll.
+    static func fittingHeight(of textView: UITextView, width: CGFloat, maxHeight: CGFloat) -> (height: CGFloat, scrolls: Bool) {
+        let fitting = textView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        let height = max(minimumHeight, ceil(fitting.height))
+        return (min(height, maxHeight), height > maxHeight)
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -479,8 +459,24 @@ struct ComposerTextView: UIViewRepresentable {
         textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         textView.setContentHuggingPriority(.defaultLow, for: .horizontal)
         textView.text = text
-        context.coordinator.updateHeight(for: textView)
+        textView.onShiftReturn = { [weak coordinator, weak textView] in
+            guard let textView else { return }
+            coordinator?.insertLineBreak(in: textView)
+        }
         return textView
+    }
+
+    /// Measured against the width SwiftUI proposes, so the first layout of a
+    /// restored draft, a rotation, or a split-view resize all get the right
+    /// height in the same pass, without a zero-width measurement or a deferred
+    /// state write.
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
+        let fit = Self.fittingHeight(of: uiView, width: width, maxHeight: maxHeight)
+        if uiView.isScrollEnabled != fit.scrolls {
+            uiView.isScrollEnabled = fit.scrolls
+        }
+        return CGSize(width: width, height: fit.height)
     }
 
     func updateUIView(_ uiView: UITextView, context: Context) {
@@ -501,13 +497,13 @@ struct ComposerTextView: UIViewRepresentable {
         } else if !isFocused, uiView.isFirstResponder {
             uiView.resignFirstResponder()
         }
-
-        context.coordinator.updateHeight(for: uiView)
     }
 
     @MainActor
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: ComposerTextView
+        /// Set while Shift-Return inserts a line break, which must never send.
+        private var isInsertingLineBreak = false
 
         init(parent: ComposerTextView) {
             self.parent = parent
@@ -525,8 +521,9 @@ struct ComposerTextView: UIViewRepresentable {
         }
 
         func textViewDidChange(_ textView: UITextView) {
+            // The new text re-renders the composer, and SwiftUI re-measures it
+            // through `sizeThatFits`.
             parent.text = textView.text
-            updateHeight(for: textView)
         }
 
         func textView(
@@ -534,6 +531,7 @@ struct ComposerTextView: UIViewRepresentable {
             shouldChangeTextIn range: NSRange,
             replacementText text: String
         ) -> Bool {
+            guard !isInsertingLineBreak else { return true }
             switch ComposerReturnKeyBehavior.action(
                 sendOnReturn: parent.sendOnReturn,
                 canSend: parent.canSend,
@@ -554,36 +552,26 @@ struct ComposerTextView: UIViewRepresentable {
             parent.onSend()
         }
 
-        func updateHeight(for textView: UITextView) {
-            let fittingSize = CGSize(
-                width: max(textView.bounds.width, 1),
-                height: .greatestFiniteMagnitude
-            )
-            let targetHeight = max(24, ceil(textView.sizeThatFits(fittingSize).height))
-            let clampedHeight = min(targetHeight, parent.maxHeight)
-
-            if textView.isScrollEnabled != (targetHeight > parent.maxHeight) {
-                textView.isScrollEnabled = targetHeight > parent.maxHeight
-            }
-
-            guard abs(parent.measuredHeight - clampedHeight) > 0.5 else {
-                return
-            }
-
-            DispatchQueue.main.async {
-                self.parent.measuredHeight = clampedHeight
-            }
+        /// Shift-Return always starts a new line, so a hardware keyboard can
+        /// still write one when Return is set to send.
+        func insertLineBreak(in textView: UITextView) {
+            isInsertingLineBreak = true
+            defer { isInsertingLineBreak = false }
+            textView.insertText("\n")
         }
     }
 }
 
 /// Sends on Command-Return from a hardware keyboard. The key command asks for priority
 /// over the text view's own Return handling, which would otherwise insert a line break
-/// before a menu shortcut or a button's shortcut could see the key.
+/// before a menu shortcut or a button's shortcut could see the key. Shift-Return
+/// likewise always inserts a line break, even when Return sends.
 final class KeyboardSendingTextView: UITextView {
     var onCommandReturn: (() -> Void)?
+    var onShiftReturn: (() -> Void)?
 
-    override var keyCommands: [UIKeyCommand]? {
+    /// Built once; UIKit asks for key commands often while validating the responder chain.
+    private lazy var composerKeyCommands: [UIKeyCommand] = {
         let send = UIKeyCommand(
             title: String(localized: "Send Message", bundle: .appLocalized),
             action: #selector(sendFromKeyboard),
@@ -591,10 +579,20 @@ final class KeyboardSendingTextView: UITextView {
             modifierFlags: .command
         )
         send.wantsPriorityOverSystemBehavior = true
-        return (super.keyCommands ?? []) + [send]
+        let lineBreak = UIKeyCommand(input: "\r", modifierFlags: .shift, action: #selector(insertLineBreakFromKeyboard))
+        lineBreak.wantsPriorityOverSystemBehavior = true
+        return [send, lineBreak]
+    }()
+
+    override var keyCommands: [UIKeyCommand]? {
+        (super.keyCommands ?? []) + composerKeyCommands
     }
 
     @objc private func sendFromKeyboard() {
         onCommandReturn?()
+    }
+
+    @objc private func insertLineBreakFromKeyboard() {
+        onShiftReturn?()
     }
 }

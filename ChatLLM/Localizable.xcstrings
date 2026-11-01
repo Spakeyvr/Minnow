@@ -1397,6 +1397,28 @@
         }
       }
     },
+    "Choose the model for this chat." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wähle das Modell für diesen Chat."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Choose the model for this chat."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Elige el modelo para este chat."
+          }
+        }
+      }
+    },
     "Clear Preferences" : {
       "localizations" : {
         "de" : {
@@ -1817,6 +1839,28 @@
         }
       }
     },
+    "Couldn't Save API Key" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Schlüssel konnte nicht gespeichert werden"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Couldn't Save API Key"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se pudo guardar la clave de API"
+          }
+        }
+      }
+    },
     "Couldn't stop the active response. Please try deleting again." : {
       "localizations" : {
         "de" : {
@@ -2011,6 +2055,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Eliminar todos excepto el actual"
+          }
+        }
+      }
+    },
+    "Delete Chat?" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chat löschen?"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Delete Chat?"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "¿Eliminar chat?"
           }
         }
       }
@@ -3313,6 +3379,28 @@
         }
       }
     },
+    "How much conversation a local MLX model can use. On this device, %@ supports up to %lld tokens." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wie viel des Chatverlaufs ein lokales MLX-Modell verwenden kann. Auf diesem Gerät unterstützt %@ bis zu %lld Tokens."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How much conversation a local MLX model can use. On this device, %@ supports up to %lld tokens."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cuánto historial puede usar un modelo MLX local. En este dispositivo, %@ admite hasta %lld tokens."
+          }
+        }
+      }
+    },
     "How much conversation a local MLX model can use. This device supports up to %lld tokens." : {
       "localizations" : {
         "de" : {
@@ -3353,6 +3441,72 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "¿Cómo debe responder el asistente?"
+          }
+        }
+      }
+    },
+    "Hugging Face is limiting requests right now. Try again in a few minutes." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face begrenzt gerade die Anfragen. Versuche es in ein paar Minuten erneut."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face is limiting requests right now. Try again in a few minutes."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face está limitando las solicitudes en este momento. Vuelve a intentarlo en unos minutos."
+          }
+        }
+      }
+    },
+    "Hugging Face is temporarily unavailable (HTTP %lld). Try again later." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face ist vorübergehend nicht erreichbar (HTTP %lld). Versuche es später erneut."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face is temporarily unavailable (HTTP %lld). Try again later."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face no está disponible temporalmente (HTTP %lld). Vuelve a intentarlo más tarde."
+          }
+        }
+      }
+    },
+    "Hugging Face returned an unexpected response (HTTP %lld)." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face hat eine unerwartete Antwort geliefert (HTTP %lld)."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face returned an unexpected response (HTTP %lld)."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face ha devuelto una respuesta inesperada (HTTP %lld)."
           }
         }
       }
@@ -3797,24 +3951,24 @@
         }
       }
     },
-    "Let the On-Device Models context window go up to 32,768 tokens, past this device’s limit. Large contexts can run out of memory and crash the app." : {
+    "Let the On-Device Models context window go up to %@ tokens, past this device’s limit. Large contexts can run out of memory and crash the app." : {
       "localizations" : {
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Erlaubt unter „Modelle auf dem Gerät“ ein Kontextfenster von bis zu 32.768 Tokens, über das Limit dieses Geräts hinaus. Große Kontexte können den Speicher erschöpfen und die App abstürzen lassen."
+            "value" : "Erlaubt unter „Modelle auf dem Gerät“ ein Kontextfenster von bis zu %@ Tokens, über das Limit dieses Geräts hinaus. Große Kontexte können den Speicher erschöpfen und die App abstürzen lassen."
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Let the On-Device Models context window go up to 32,768 tokens, past this device’s limit. Large contexts can run out of memory and crash the app."
+            "value" : "Let the On-Device Models context window go up to %@ tokens, past this device’s limit. Large contexts can run out of memory and crash the app."
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Permite que la ventana de contexto de Modelos en el dispositivo llegue a 32.768 tokens, por encima del límite de este dispositivo. Los contextos grandes pueden agotar la memoria y cerrar la app."
+            "value" : "Permite que la ventana de contexto de Modelos en el dispositivo llegue a %@ tokens, por encima del límite de este dispositivo. Los contextos grandes pueden agotar la memoria y cerrar la app."
           }
         }
       }
@@ -7102,6 +7256,28 @@
         }
       }
     },
+    "The model server finished the transfer without delivering a file." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Modellserver hat die Übertragung beendet, ohne eine Datei zu liefern."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The model server finished the transfer without delivering a file."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El servidor de modelos ha terminado la transferencia sin entregar ningún archivo."
+          }
+        }
+      }
+    },
     "The model server returned an unexpected response." : {
       "localizations" : {
         "de" : {
@@ -7142,6 +7318,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "El servidor de modelos ha devuelto HTTP %lld."
+          }
+        }
+      }
+    },
+    "The reply stopped while the model was still thinking, so there's no answer. Try regenerating it." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Antwort wurde beendet, während das Modell noch nachgedacht hat, daher gibt es keine Antwort. Versuche, sie neu zu generieren."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The reply stopped while the model was still thinking, so there's no answer. Try regenerating it."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La respuesta se detuvo mientras el modelo aún estaba pensando, así que no hay respuesta. Intenta regenerarla."
           }
         }
       }
@@ -7258,6 +7456,28 @@
         }
       }
     },
+    "The Tavily API key couldn't be stored in the Keychain. Try again." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Tavily-API-Schlüssel konnte nicht im Schlüsselbund gespeichert werden. Versuche es erneut."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Tavily API key couldn't be stored in the Keychain. Try again."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se pudo guardar la clave de API de Tavily en el llavero. Vuelve a intentarlo."
+          }
+        }
+      }
+    },
     "The Tavily API key is missing or invalid." : {
       "localizations" : {
         "de" : {
@@ -7298,6 +7518,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Pensando…"
+          }
+        }
+      }
+    },
+    "This chat and its attachments will be permanently deleted. This cannot be undone." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieser Chat und seine Anhänge werden dauerhaft gelöscht. Dies kann nicht rückgängig gemacht werden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This chat and its attachments will be permanently deleted. This cannot be undone."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Este chat y sus archivos adjuntos se eliminarán permanentemente. Esta acción no se puede deshacer."
           }
         }
       }
@@ -7366,6 +7608,50 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Este modelo no puede leer imágenes."
+          }
+        }
+      }
+    },
+    "This model requires access on Hugging Face and can't be downloaded." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Modell erfordert einen Zugang bei Hugging Face und kann nicht heruntergeladen werden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This model requires access on Hugging Face and can't be downloaded."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Este modelo requiere acceso en Hugging Face y no se puede descargar."
+          }
+        }
+      }
+    },
+    "This model version was not found on Hugging Face." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diese Modellversion wurde auf Hugging Face nicht gefunden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This model version was not found on Hugging Face."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se ha encontrado esta versión del modelo en Hugging Face."
           }
         }
       }
@@ -8158,6 +8444,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Tu clave se guarda en el llavero y solo se envía a Tavily para autenticar las búsquedas web."
+          }
+        }
+      }
+    },
+    "Your Tavily plan has run out of search credits. Check your plan on tavily.com." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dein Tavily-Tarif hat keine Suchguthaben mehr. Prüfe deinen Tarif auf tavily.com."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your Tavily plan has run out of search credits. Check your plan on tavily.com."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tu plan de Tavily se ha quedado sin créditos de búsqueda. Revisa tu plan en tavily.com."
           }
         }
       }

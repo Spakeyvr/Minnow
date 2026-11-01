@@ -5,6 +5,11 @@
 *.bin
 *.safetensors
 *.gguf
+*.npz
+*.pt
+*.pth
+*.onnx
+*.mlpackage/
 weights/
 
 # Xcode build artifacts and user state

@@ -21,37 +21,80 @@ enum TavilyAPIKeyStore {
         category: "TavilyAPIKeyStore"
     )
 
+    private enum KeychainRead {
+        case found(String)
+        case notFound
+        /// The Keychain could not answer, for example while the device is locked.
+        case unavailable(OSStatus)
+    }
+
+    private struct CacheKey: Hashable {
+        let service: String
+        let account: String
+    }
+
+    /// Each view model and the settings screen ask for the key, and every
+    /// Keychain read is a round trip to securityd on the main thread. Only
+    /// definite answers are cached; save and clear keep the cache current.
+    private static var cachedKeys: [CacheKey: String?] = [:]
+
     static func currentKey(
         userDefaults: UserDefaults = .standard,
         service: String = TavilyAPIKeyStore.service,
         account: String = TavilyAPIKeyStore.account
     ) -> String? {
-        migrateLegacyPlaintextKeyIfNeeded(
-            userDefaults: userDefaults,
-            service: service,
-            account: account
-        )
-
-        if let current = getKeychainValue(service: service, account: account) {
-            return current
+        let cacheKey = CacheKey(service: service, account: account)
+        // Cheap in-memory check; a plaintext key from an old build may appear
+        // in any defaults suite.
+        if userDefaults.object(forKey: userDefaultsKey) != nil {
+            migrateLegacyPlaintextKeyIfNeeded(
+                userDefaults: userDefaults,
+                service: service,
+                account: account
+            )
+        }
+        if let cached = cachedKeys[cacheKey] {
+            return cached
         }
 
-        guard service == Self.service,
-              let legacy = getKeychainValue(service: legacyService, account: account) else {
+        switch getKeychainValue(service: service, account: account) {
+        case .found(let current):
+            cachedKeys[cacheKey] = current
+            return current
+        case .unavailable:
+            return nil
+        case .notFound:
+            break
+        }
+
+        guard service == Self.service else {
+            cachedKeys[cacheKey] = .some(nil)
             return nil
         }
-        if saveKeychainValue(legacy, service: service, account: account) {
-            deleteKeychainValue(service: legacyService, account: account)
+        switch getKeychainValue(service: legacyService, account: account) {
+        case .found(let legacy):
+            if saveKeychainValue(legacy, service: service, account: account) {
+                deleteKeychainValue(service: legacyService, account: account)
+                cachedKeys[cacheKey] = legacy
+            }
+            return legacy
+        case .notFound:
+            cachedKeys[cacheKey] = .some(nil)
+            return nil
+        case .unavailable:
+            return nil
         }
-        return legacy
     }
 
+    /// Returns false when the Keychain rejected the key, so callers can tell
+    /// the user it was not saved.
+    @discardableResult
     static func save(
         _ key: String,
         userDefaults: UserDefaults = .standard,
         service: String = TavilyAPIKeyStore.service,
         account: String = TavilyAPIKeyStore.account
-    ) {
+    ) -> Bool {
         let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty else {
             clear(
@@ -59,13 +102,17 @@ enum TavilyAPIKeyStore {
                 service: service,
                 account: account
             )
-            return
+            return true
         }
 
-        if saveKeychainValue(trimmedKey, service: service, account: account) {
-            userDefaults.removeObject(forKey: userDefaultsKey)
-            NotificationCenter.default.post(name: didChangeNotification, object: nil)
+        guard saveKeychainValue(trimmedKey, service: service, account: account) else {
+            cachedKeys.removeValue(forKey: CacheKey(service: service, account: account))
+            return false
         }
+        cachedKeys[CacheKey(service: service, account: account)] = trimmedKey
+        userDefaults.removeObject(forKey: userDefaultsKey)
+        NotificationCenter.default.post(name: didChangeNotification, object: nil)
+        return true
     }
 
     static func clear(
@@ -79,6 +126,7 @@ enum TavilyAPIKeyStore {
             deleteKeychainValue(service: legacyService, account: account)
         }
         userDefaults.removeObject(forKey: userDefaultsKey)
+        cachedKeys[CacheKey(service: service, account: account)] = .some(nil)
 
         if postNotification {
             NotificationCenter.default.post(name: didChangeNotification, object: nil)
@@ -97,17 +145,26 @@ enum TavilyAPIKeyStore {
         let legacyValue = userDefaults.string(forKey: userDefaultsKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-        defer {
-            userDefaults.removeObject(forKey: userDefaultsKey)
-        }
-
         guard !legacyValue.isEmpty else {
+            userDefaults.removeObject(forKey: userDefaultsKey)
             return
         }
 
-        if getKeychainValue(service: service, account: account) != legacyValue {
-            _ = saveKeychainValue(legacyValue, service: service, account: account)
+        let isStored: Bool
+        if case .found(legacyValue) = getKeychainValue(service: service, account: account) {
+            isStored = true
+        } else {
+            isStored = saveKeychainValue(legacyValue, service: service, account: account)
         }
+
+        // Keep the only copy of the key until the Keychain holds it, for
+        // example when a locked device rejects the write; the next read retries.
+        guard isStored else {
+            logger.error("Tavily key migration deferred: Keychain write failed")
+            return
+        }
+        cachedKeys[CacheKey(service: service, account: account)] = legacyValue
+        userDefaults.removeObject(forKey: userDefaultsKey)
     }
 
     @discardableResult
@@ -148,7 +205,7 @@ enum TavilyAPIKeyStore {
         return true
     }
 
-    private static func getKeychainValue(service: String, account: String) -> String? {
+    private static func getKeychainValue(service: String, account: String) -> KeychainRead {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -159,13 +216,19 @@ enum TavilyAPIKeyStore {
 
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess,
-              let data = item as? Data,
-              let value = String(data: data, encoding: .utf8) else {
-            return nil
+        switch status {
+        case errSecSuccess:
+            guard let data = item as? Data,
+                  let value = String(data: data, encoding: .utf8) else {
+                return .notFound
+            }
+            return .found(value)
+        case errSecItemNotFound:
+            return .notFound
+        default:
+            logger.error("Tavily key SecItemCopyMatching failed: OSStatus \(status)")
+            return .unavailable(status)
         }
-
-        return value
     }
 
     private static func deleteKeychainValue(service: String, account: String) {

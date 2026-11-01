@@ -32,12 +32,7 @@ extension ChatLLMTests {
     }
 
     @Test func cancellingActiveReasoningCapturesElapsedThinkingTime() throws {
-        let schema = Schema([Conversation.self, ChatLLM.Message.self, MessageAttachment.self])
-        let container = try ModelContainer(
-            for: schema,
-            configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
-        )
-        let context = ModelContext(container)
+        let context = try makeContext()
         let conversation = Conversation(title: "Test")
         let message = Message(
             role: .assistant,
@@ -146,7 +141,8 @@ extension ChatLLMTests {
         // Near the end of a sweep the swap lands shortly after.
         viewModel.requestStreamingActivity(.thinking, now: shimmerDate(atPhase: 0.85))
         #expect(viewModel.streamingActivity == .searching)
-        try await Task.sleep(for: .milliseconds(400))
+        let swap = try #require(viewModel.streamingActivityTask)
+        await swap.value
         #expect(viewModel.streamingActivity == .thinking)
 
         viewModel.resetStreamingActivity()
@@ -174,12 +170,7 @@ extension ChatLLMTests {
     }
 
     @Test func thinkingShimmerStopsOnceReasoningCompletes() throws {
-        let schema = Schema([Conversation.self, ChatLLM.Message.self, MessageAttachment.self])
-        let container = try ModelContainer(
-            for: schema,
-            configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
-        )
-        let context = ModelContext(container)
+        let context = try makeContext()
         let conversation = Conversation(title: "Test")
         let message = Message(
             role: .assistant,

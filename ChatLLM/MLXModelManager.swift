@@ -15,11 +15,11 @@
 //    MLXModelManager+ToolCalling.swift  Tool-template inspection and tool-response formatting
 //    MLXModelManager+Memory.swift       Memory pressure handling and teardown
 //
-//  Stored state lives here; it is internal so the extension files can share it.
-//  Three published properties (pendingModelToLoad, activeDownloadModelID,
-//  downloadErrorModelID) intentionally lost their
-//  private(set) qualifiers for the same reason: Swift has no module-scoped
-//  setter, so cross-file extensions must be able to write them.
+//  Stored state lives here. All of it, published properties included, is
+//  internal rather than private(set): Swift has no setter scope that spans an
+//  extension in another file, so the Type+Concern files could not write it
+//  otherwise. Code outside the manager should treat it as read-only and go
+//  through methods such as `reportLoadError(_:)` and `clearLoadError()`.
 //
 
 import Foundation
@@ -69,17 +69,28 @@ final class MLXModelManager: ObservableObject {
     var compatibilityErrors: [String: String] = [:]
     var toolTemplateInspectionCache: [String: ToolTemplateInspection] = [:]
     var packageMetadataCache: [String: ModelPackageMetadata] = [:]
-    var promptTokenCountCache: [PromptTokenCountCacheKey: Int] = [:]
-    var promptTokenCountCacheOrder: [PromptTokenCountCacheKey] = []
+    /// Bumped by every availability refresh, so a background scan that finishes
+    /// after a newer refresh does not overwrite it with older file state.
+    var availabilityRefreshGeneration = 0
+    var promptTokenCountCache = PromptTokenCountCache()
     var activeLoadID: UUID?
     var installedWorkerLoadID: UUID?
     var deferredPrewarmModelID: String?
     var deferredTuningModelID: String?
     var prewarmInFlightModelID: String?
     var tuningTask: Task<Void, Never>?
+    /// Identifies `tuningTask`, so a finishing task only clears the property
+    /// while it still refers to that task and not to a newer one.
+    var tuningTaskID: UUID?
+    /// Post-load shader prewarm. Tracked so teardown and a superseding load
+    /// can cancel it instead of letting it hold the old container.
+    var prewarmTask: Task<Void, Never>?
     var hasSeenMemoryWarningSinceCurrentLoad = false
     let deviceSupportProfile: MLXDeviceSupportProfile
     let inferenceWorker: MLXInferenceWorker
+    /// Shared with `inferenceWorker`, so deleting or replacing a model can
+    /// drop the prompt prefixes saved for its weights.
+    let promptPrefixCache: MLXPromptPrefixCache
     var simulatedDownloadedModelIDs: Set<String> = []
     /// Sends a model's ID when its download finishes. Whether to load it is the
     /// backend bridge's call, since only it knows which model the chat is using.
@@ -88,13 +99,13 @@ final class MLXModelManager: ObservableObject {
     let documentsDirectory: URL
     let defaults: UserDefaults
 
-    struct ModelInstallationStatus {
+    nonisolated struct ModelInstallationStatus: Sendable {
         let isInstalled: Bool
         let isCompatible: Bool
         let compatibilityError: String?
     }
 
-    struct ModelPackageMetadata {
+    nonisolated struct ModelPackageMetadata: Sendable {
         let architecture: String?
         let processorClass: String?
         let modelType: String?
@@ -113,20 +124,26 @@ final class MLXModelManager: ObservableObject {
             for: .documentDirectory, in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         MLXRuntimeConfiguration.configureForCurrentProcess()
-        self.deviceSupportProfile = deviceSupportProfile ?? MLXDeviceSupportProfile.current
+        self.deviceSupportProfile = deviceSupportProfile ?? MLXDeviceSupportProfile.current(defaults: defaults)
+        let subsystem = Bundle.main.bundleIdentifier ?? "ChatLLM"
+        let promptPrefixCache = MLXPromptPrefixCache(subsystem: subsystem)
+        self.promptPrefixCache = promptPrefixCache
         self.inferenceWorker = MLXInferenceWorker(
-            subsystem: Bundle.main.bundleIdentifier ?? "ChatLLM"
+            subsystem: subsystem,
+            promptPrefixCache: promptPrefixCache
         )
         removeObsoleteModelDirectories()
-        availableModels = Self.modelDefinitions.map { definition in
-            var model = definition
-            let status = installationStatus(for: model)
-            model.isAvailable = status.isInstalled && status.isCompatible
-            if let error = status.compatibilityError {
-                compatibilityErrors[model.id] = error
-            }
-            return model
-        }
+        // Re-downloadable weights must stay out of iCloud and device backups,
+        // including models downloaded before the downloader set the flag.
+        ModelDownloader.excludeFromBackup(
+            self.documentsDirectory.appendingPathComponent("Models", isDirectory: true)
+        )
+        // Synchronous on purpose: the backend bridge may load the selected
+        // model right after init, which needs availability. The scan reads
+        // only a config and processor JSON per model; tokenizer files and
+        // directory removal happen off the main actor.
+        availableModels = Self.modelDefinitions
+        refreshModelAvailability()
 
         memoryWarningCancellable = NotificationCenter.default.publisher(
             for: UIApplication.didReceiveMemoryWarningNotification
@@ -159,25 +176,31 @@ final class MLXModelManager: ObservableObject {
         // the process — including this manager's own prefill-tuning writes and
         // each of the ~13 keys a settings save persists. Collapse the stream to
         // actual transitions of the one flag before hopping to the main actor.
+        // The notification is posted on whichever thread wrote the default, so
+        // these closures are @Sendable rather than main-actor isolated.
+        // UserDefaults is documented as thread-safe; it just isn't annotated Sendable.
+        nonisolated(unsafe) let observedDefaults = defaults
         settingsDidChangeCancellable = NotificationCenter.default.publisher(
             for: UserDefaults.didChangeNotification
         )
-        .map { _ in
-            defaults.bool(forKey: AppSettingsKeys.disableRAMPrecautions)
+        .map { @Sendable _ in
+            observedDefaults.bool(forKey: AppSettingsKeys.disableRAMPrecautions)
         }
         .prepend(defaults.bool(forKey: AppSettingsKeys.disableRAMPrecautions))
         .removeDuplicates()
         .dropFirst()
-        .sink { [weak self] _ in
+        .sink { @Sendable [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.refreshModelAvailability()
+                await self?.refreshModelAvailabilityInBackground()
             }
         }
 
         if restoresBackgroundDownloads { restoreBackgroundDownloadIfNeeded() }
     }
 
-    deinit {
+    // Isolated so the Combine cancellables, which are not Sendable, are
+    // released on the main actor that created them.
+    isolated deinit {
         memoryWarningCancellable?.cancel()
         appWillResignActiveCancellable?.cancel()
         appDidEnterBackgroundCancellable?.cancel()

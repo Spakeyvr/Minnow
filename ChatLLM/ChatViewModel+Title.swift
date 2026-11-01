@@ -101,6 +101,8 @@ extension ChatViewModel {
 
     /// Names the chat from what has been said so far. Runs after every reply until a
     /// title is set, so a stopped first reply or a vague opener is named on a later turn.
+    /// Replies schedule it through `scheduleAutoNamingIfNeeded`, outside the reply's
+    /// lifecycle, so the composer stays usable while it runs.
     internal func generateChatTitle() async {
         guard isActive, !Task.isCancelled,
               AppLanguage.isDefaultConversationTitle(conversation.title),
@@ -215,8 +217,11 @@ extension ChatViewModel {
         return String(wordBoundary) + "…"
     }
 
-    /// Guardrail, context, and language failures repeat on every attempt.
+    /// Guardrail, context, and language failures repeat on every attempt. A timeout is the
+    /// slowest failure, and a retry would first wait for the timed-out session to unwind,
+    /// so it falls back to the word-based title at once.
     nonisolated static func shouldRetryTitleGeneration(after error: Error) -> Bool {
+        if error is ChatViewModel.GenerationTimeoutError { return false }
         guard let error = error as? LanguageModelError else { return true }
         switch error {
         case .guardrailViolation, .refusal, .contextSizeExceeded, .unsupportedLanguageOrLocale,

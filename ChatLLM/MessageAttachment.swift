@@ -55,32 +55,26 @@ final class MessageAttachment {
         self.id = id
         self.type = type
         // Store a relative URL with just the filename so it stays container-agnostic.
-        self.fileURL = URL(string: fileURL.lastPathComponent) ?? URL(fileURLWithPath: fileURL.lastPathComponent)
+        let storedName = fileURL.lastPathComponent
+        self.fileURL = URL(string: storedName)
+            ?? URL(string: storedName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? "")
+            ?? Self.attachmentsDirectory.appending(path: storedName, directoryHint: .notDirectory)
         self.fileName = fileName
         self.createdAt = createdAt
     }
-    
+
+    /// `Documents/Attachments` in the current app container. The container path
+    /// does not change while the app runs, so it is resolved once.
+    nonisolated static let attachmentsDirectory = URL.documentsDirectory
+        .appending(path: "Attachments", directoryHint: .isDirectory)
+
     /// Get the actual file URL in the current app container
     var actualFileURL: URL {
-        // If the stored URL is already absolute and exists, use it (backward compatibility)
-        if fileURL.path.starts(with: "/") && FileManager.default.fileExists(atPath: fileURL.path) {
+        // Rows saved by early builds hold an absolute path; use it while it still exists.
+        if fileURL.path.hasPrefix("/") && FileManager.default.fileExists(atPath: fileURL.path) {
             return fileURL
         }
-        
-        // Otherwise, reconstruct from Documents directory
-        do {
-            let documentsURL = try FileManager.default.url(
-                for: .documentDirectory,
-                in: .userDomainMask,
-                appropriateFor: nil,
-                create: false
-            )
-            let attachmentsDir = documentsURL.appendingPathComponent("Attachments", isDirectory: true)
-            return attachmentsDir.appendingPathComponent(fileURL.lastPathComponent)
-        } catch {
-            attachmentLogger.warning("Error constructing attachment file URL: \((error as NSError).localizedDescription, privacy: .public)")
-            return fileURL // Fallback to stored URL
-        }
+        return Self.attachmentsDirectory.appending(path: fileURL.lastPathComponent, directoryHint: .notDirectory)
     }
     
     /// Load the image from disk
@@ -100,17 +94,24 @@ final class MessageAttachment {
 }
 
 extension MessageAttachment {
-    /// Files still used by saved chats. Fetches attachment rows directly, so cleanup
-    /// doesn't fault in every message of every chat just to reach their attachments.
+    /// Files still used by saved chats, as URLs in the current Attachments directory.
+    /// The store filters attachment rows by their chat, so neither messages nor
+    /// conversations are faulted in; only each row's stored file name is read.
     static func referencedFileURLs(
         in context: ModelContext,
         excludingConversationIDs excludedConversationIDs: Set<UUID> = []
     ) throws -> Set<URL> {
-        let attachments = try context.fetch(FetchDescriptor<MessageAttachment>())
-        return Set(attachments.compactMap { attachment in
-            guard let conversationID = attachment.message?.conversation?.id,
-                  !excludedConversationIDs.contains(conversationID) else { return nil }
-            return attachment.actualFileURL
+        let excludedIDs = Array(excludedConversationIDs)
+        let predicate = #Predicate<MessageAttachment> { attachment in
+            if let conversation = attachment.message?.conversation {
+                !excludedIDs.contains(conversation.id)
+            } else {
+                false
+            }
+        }
+        let attachments = try context.fetch(FetchDescriptor(predicate: predicate))
+        return Set(attachments.map { attachment in
+            attachmentsDirectory.appending(path: attachment.fileURL.lastPathComponent, directoryHint: .notDirectory)
         })
     }
 }

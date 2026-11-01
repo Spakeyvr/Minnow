@@ -60,7 +60,7 @@ private struct MarkdownBlockView: View {
     var body: some View {
         switch block {
         case let .heading(level, text):
-            MarkdownInlineText(markdown: text, fontSize: fontSize * Self.headingScale(level), tone: tone)
+            MarkdownInlineText(markdown: text, fontSize: fontSize * MarkdownTypography.headingScale(level), tone: tone)
                 .fontWeight(.bold)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -87,16 +87,6 @@ private struct MarkdownBlockView: View {
                 .frame(maxWidth: .infinity)
         }
     }
-
-    private static func headingScale(_ level: Int) -> Double {
-        switch level {
-        case 1: return 1.65
-        case 2: return 1.45
-        case 3: return 1.25
-        case 4: return 1.12
-        default: return 1.0
-        }
-    }
 }
 
 // MARK: - Code
@@ -105,7 +95,6 @@ private struct MarkdownCodeBlockView: View {
     let language: String?
     let code: String
     let fontSize: Double
-    @State private var copyFeedback: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -142,14 +131,12 @@ private struct MarkdownCodeBlockView: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
-            Button(action: copy) {
-                Label(copyTitle, systemImage: copyFeedback == nil ? "doc.on.doc" : "checkmark")
-                .contentTransition(.symbolEffect(.replace))
-                .frame(minWidth: 44, minHeight: 44)
-                .contentShape(Rectangle())
+            CopyFeedbackButton(text: code, accessibilityLabel: { $0 ? "Copied" : "Copy Code" }) { isShowingFeedback in
+                Label(isShowingFeedback ? "Copied" : "Copy", systemImage: isShowingFeedback ? "checkmark" : "doc.on.doc")
+                    .contentTransition(.symbolEffect(.replace))
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(copyAccessibilityLabel)
             .accessibilityIdentifier("markdown.copyCode")
         }
         .font(.system(size: fontSize * 0.75, weight: .medium))
@@ -157,17 +144,29 @@ private struct MarkdownCodeBlockView: View {
         .padding(.leading, fontSize * 0.9)
         .padding(.trailing, fontSize * 0.4)
     }
+}
 
-    private var copyTitle: LocalizedStringKey {
-        copyFeedback == nil ? "Copy" : "Copied"
-    }
+// MARK: - Copy button
 
-    private var copyAccessibilityLabel: LocalizedStringKey {
-        copyFeedback == nil ? "Copy Code" : "Copied"
+/// Copies `text` and briefly shows a checkmark. Shared by code blocks and the
+/// message actions bar so both give the same feedback.
+struct CopyFeedbackButton<Content: View>: View {
+    let text: String
+    let accessibilityLabel: (Bool) -> LocalizedStringKey
+    @ViewBuilder let label: (Bool) -> Content
+    @State private var copyFeedback: Task<Void, Never>?
+
+    var body: some View {
+        let isShowingFeedback = copyFeedback != nil
+        Button(action: copy) {
+            label(isShowingFeedback)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel(isShowingFeedback))
     }
 
     private func copy() {
-        UIPasteboard.general.string = code
+        UIPasteboard.general.string = text
         AppHaptics.impact(.light)
         copyFeedback?.cancel()
         copyFeedback = Task {
@@ -346,15 +345,35 @@ struct MarkdownInlineText: View {
     let markdown: String
     let fontSize: Double
     var tone: RichMarkdownView.TextTone = .primary
+    @Environment(\.isMarkdownStreaming) private var isStreaming
 
     var body: some View {
-        Text(MarkdownInlineRenderer.attributed(markdown, fontSize: fontSize))
+        Text(MarkdownInlineRenderer.attributed(markdown, fontSize: fontSize, caching: !isStreaming))
             .font(.system(size: fontSize))
             .foregroundStyle(tone == .secondary ? .secondary : .primary)
     }
 }
 
 enum MarkdownInlineRenderer {
+
+    private nonisolated struct CacheKey: Hashable, Sendable {
+        let markdown: String
+        let fontSize: Double
+    }
+
+    /// Whole-tree invalidations (appearance, Dynamic Type, the message size
+    /// setting, a math bubble swapping in its fallback) re-run every inline
+    /// body, so finished blocks keep their attributed strings here.
+    private static let cache = BoundedCache<CacheKey, AttributedString>(limit: 256)
+
+    /// Like `attributed(_:fontSize:)`, memoised unless `caching` is false. A
+    /// streaming block is a new key on every token, so it is never stored.
+    static func attributed(_ markdown: String, fontSize: Double, caching: Bool) -> AttributedString {
+        guard caching else { return attributed(markdown, fontSize: fontSize) }
+        return cache.value(for: CacheKey(markdown: markdown, fontSize: fontSize)) {
+            attributed(markdown, fontSize: fontSize)
+        }
+    }
 
     static func attributed(_ markdown: String, fontSize: Double) -> AttributedString {
         let source = sanitizedSource(markdown)
@@ -405,18 +424,79 @@ enum MarkdownInlineRenderer {
     private static func styleInlineCode(_ text: inout AttributedString, fontSize: Double) {
         for run in text.runs where run.inlinePresentationIntent?.contains(.code) == true {
             text[run.range].font = .system(size: fontSize * 0.92, design: .monospaced)
-            text[run.range].foregroundColor = Color(uiColor: .secondaryLabel)
+            text[run.range].foregroundColor = MarkdownColorToken.inlineCode.color
         }
     }
 }
 
-// MARK: - Palette
+// MARK: - Design tokens
+
+/// Heading sizes, shared by the native renderer and the math document's CSS.
+nonisolated enum MarkdownTypography {
+    /// Font-size multipliers for heading levels 1 through 4; deeper levels use body size.
+    static let headingScales: [Double] = [1.65, 1.45, 1.25, 1.12]
+
+    static func headingScale(_ level: Int) -> Double {
+        headingScales.indices.contains(level - 1) ? headingScales[level - 1] : 1.0
+    }
+
+    /// The same scale as CSS rules for the math document.
+    static var headingCSS: String {
+        let sized = headingScales.enumerated().map { "h\($0.offset + 1) { font-size: \($0.element)em; }" }
+        return (sized + ["h5, h6 { font-size: 1em; }"]).joined(separator: "\n")
+    }
+}
+
+/// The Markdown colours, shared by the native `MarkdownPalette` and the math
+/// document's `RichTextPalette`, so a change applies to both renderers.
+enum MarkdownColorToken {
+    case codeBackground
+    case codeBorder
+    case quoteBorder
+    case quoteBackground
+    case separator
+    case tableStripe
+    case inlineCode
+
+    private var base: UIColor {
+        switch self {
+        case .codeBackground, .tableStripe: .secondarySystemBackground
+        case .codeBorder, .separator: .separator
+        case .quoteBorder: .systemBlue
+        case .quoteBackground: .tertiarySystemBackground
+        case .inlineCode: .secondaryLabel
+        }
+    }
+
+    /// Multiplies the base colour's own alpha, like SwiftUI's `opacity`.
+    private var opacity: CGFloat {
+        switch self {
+        case .codeBackground, .inlineCode: 1
+        case .codeBorder, .tableStripe: 0.45
+        case .quoteBorder: 0.5
+        case .quoteBackground: 0.7
+        case .separator: 0.35
+        }
+    }
+
+    var color: Color {
+        Color(uiColor: base).opacity(opacity)
+    }
+
+    func resolvedColor(with traits: UITraitCollection) -> UIColor {
+        let resolved = base.resolvedColor(with: traits)
+        guard opacity < 1 else { return resolved }
+        var alpha: CGFloat = 0
+        resolved.getRed(nil, green: nil, blue: nil, alpha: &alpha)
+        return resolved.withAlphaComponent(alpha * opacity)
+    }
+}
 
 enum MarkdownPalette {
-    static let codeBackground = Color(uiColor: .secondarySystemBackground)
-    static let codeBorder = Color(uiColor: .separator).opacity(0.45)
-    static let quoteBorder = Color(uiColor: .systemBlue).opacity(0.5)
-    static let quoteBackground = Color(uiColor: .tertiarySystemBackground).opacity(0.7)
-    static let separator = Color(uiColor: .separator).opacity(0.35)
-    static let tableStripe = Color(uiColor: .secondarySystemBackground).opacity(0.45)
+    static let codeBackground = MarkdownColorToken.codeBackground.color
+    static let codeBorder = MarkdownColorToken.codeBorder.color
+    static let quoteBorder = MarkdownColorToken.quoteBorder.color
+    static let quoteBackground = MarkdownColorToken.quoteBackground.color
+    static let separator = MarkdownColorToken.separator.color
+    static let tableStripe = MarkdownColorToken.tableStripe.color
 }

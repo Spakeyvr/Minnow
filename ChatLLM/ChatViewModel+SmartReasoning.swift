@@ -21,13 +21,16 @@ extension ChatViewModel {
 
     // MARK: - Smart Reasoning
 
-    /// Determines if reasoning mode should be used based on prompt complexity
-    internal func shouldUseReasoningForPrompt(_ userText: String) async throws -> Bool {
+    /// Whether a reply should reason: never on a backend or model without reasoning, always
+    /// when the model requires it or the chat's Reasoning toggle is on, and with Smart
+    /// Reasoning only when the prompt looks like it needs it. Without a prompt (a reply
+    /// with no preceding user message) Smart Reasoning has nothing to judge.
+    internal func shouldUseReasoningForPrompt(_ userText: String?) -> Bool {
         let backendBridge = self.backendBridge
         guard backendBridge.reasoningAvailable else { return false }
 
         if backendBridge.reasoningRequired || conversation.reasoningMode { return true }
-        guard conversation.smartReasoningMode else { return false }
+        guard conversation.smartReasoningMode, let userText else { return false }
 
         // Smart reasoning currently uses a local heuristic and only runs for MLX/Qwen thinking models.
         let needsReasoning = Self.promptNeedsReasoning(userText)
@@ -270,9 +273,9 @@ extension ChatViewModel {
     }
 
     internal static func reasoningCloseTagCount(in text: String) -> Int {
-        let normalized = text.lowercased()
-        return occurrenceCount(of: "</think>", in: normalized) +
-            occurrenceCount(of: "</thinking>", in: normalized)
+        // Searches case-insensitively in place instead of lowercasing a copy of
+        // the whole output on every repaint.
+        occurrenceCount(of: "</think>", in: text) + occurrenceCount(of: "</thinking>", in: text)
     }
 
     private static func occurrenceCount(of needle: String, in text: String) -> Int {
@@ -280,12 +283,24 @@ extension ChatViewModel {
         var count = 0
         var searchStart = text.startIndex
 
-        while let range = text.range(of: needle, range: searchStart..<text.endIndex) {
+        while let range = text.range(of: needle, options: .caseInsensitive, range: searchStart..<text.endIndex) {
             count += 1
             searchStart = range.upperBound
         }
 
         return count
+    }
+
+    /// True when the output stops inside a reasoning block: an opening tag with no close
+    /// after it, or (when the prompt itself opens the block, as MLX does) no close at all.
+    nonisolated static func outputEndsInsideReasoning(_ text: String, reasoningOpensInPrompt: Bool) -> Bool {
+        // "<think" also matches "<thinking>", and "</think" matches "</thinking>".
+        let lastOpen = text.range(of: "<think", options: [.caseInsensitive, .backwards])
+        guard let lastClose = text.range(of: "</think", options: [.caseInsensitive, .backwards]) else {
+            return reasoningOpensInPrompt || lastOpen != nil
+        }
+        guard let lastOpen else { return false }
+        return lastOpen.lowerBound > lastClose.lowerBound
     }
 
     private static func looksLikeReasoningContinuation(_ text: String) -> Bool {
@@ -313,8 +328,8 @@ extension ChatViewModel {
     }
 
     internal func updateMessageWithReasoningContent(_ message: Message, fullText: String, finalize: Bool = false) {
-        // DEBUG: Log if we're updating with empty/whitespace-only content
-        if fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        // Stops at the first visible character instead of trimming a copy of the output.
+        guard fullText.contains(where: { !$0.isWhitespace }) else {
             logger.warning("updateMessageWithReasoningContent called with empty text (len=\(fullText.count, privacy: .public), id=\(message.id, privacy: .public), reasoning=\(message.isReasoningMode, privacy: .public))")
             return // Don't update with empty content
         }
@@ -329,39 +344,33 @@ extension ChatViewModel {
             cleanedText = fullText
         }
 
-        // 3) Preserve or extract any <sources> from either the existing message content or this update
+        // 2) Preserve or extract any <sources> from either the existing message content or this
+        // update. The regex runs only when a tag is present. Stored content carries its sources
+        // block at the start, where this method and captureSearchInvocations put it.
         let existingCarrier = message.isReasoningMode ? (message.finalAnswer ?? message.text) : message.text
-        let existingSources = extractSources(from: existingCarrier)
-        let newSources = extractSources(from: cleanedText)
-        let chosenSources = newSources ?? existingSources
+        let newSources = Self.containsSourcesTag(cleanedText) ? extractSources(from: cleanedText) : nil
+        let chosenSources = newSources ?? (existingCarrier.hasPrefix("<sources>") ? extractSources(from: existingCarrier) : nil)
         let sourcesBlock = chosenSources.map { "<sources>\n\($0)\n</sources>\n\n" } ?? ""
 
-        // 4) Remove <sources> from the cleanedText that we will display
-        let visiblePortion = {
-            if let s = newSources, !s.isEmpty {
-                return cleanedText.removingSourcesBlocks()
-            }
-            return cleanedText
-        }()
+        // 3) Remove <sources> from the cleanedText that we will display
+        let visiblePortion = newSources?.isEmpty == false ? cleanedText.removingSourcesBlocks() : cleanedText
 
+        // Every assignment below compares first: writing an unchanged value still
+        // dirties the SwiftData row and re-renders the bubble.
         if message.isReasoningMode {
             // MLX reasoning path: the <think> opening tag is baked into the prompt prefix,
             // so the streamed output starts with raw thinking content and ends with </think>.
             // Before </think> arrives all content is in-progress reasoning with no tags at all.
             let isMLX = backendBridge.selectedBackend == .mlx
-            if isMLX {
-                let hasClose = visiblePortion.contains("</think>") || visiblePortion.contains("</thinking>")
-                if !hasClose {
-                    // Still thinking – show in the reasoning bubble, nothing in the answer yet.
-                    let r = visiblePortion.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !r.isEmpty {
-                        message.reasoning = r
-                        if finalize {
-                            message.updateReasoningSteps()
-                        }
-                    }
-                    return
+            // One scan answers both whether reasoning has closed and how many passes there were.
+            let closeTagCount = isMLX ? Self.reasoningCloseTagCount(in: visiblePortion) : 0
+            if isMLX && closeTagCount == 0 {
+                // Still thinking – show in the reasoning bubble, nothing in the answer yet.
+                let r = visiblePortion.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !r.isEmpty {
+                    message.setIfChanged(\.reasoning, to: r)
                 }
+                return
             }
 
             // A tool call starts a new reasoning pass, so the answer follows the
@@ -372,80 +381,72 @@ extension ChatViewModel {
             let isToolSession = isMLX && (
                 hasLiveSearches ||
                 phase == .postToolReasoning ||
-                Self.reasoningCloseTagCount(in: visiblePortion) > 1
+                closeTagCount > 1
             )
+
+            if isToolSession && !finalize && phase == .postToolReasoning {
+                let boundaryCount = message.postToolReasoningStartCloseTagCount ?? closeTagCount
+                if closeTagCount <= boundaryCount {
+                    let provisionalReasoning = ReasoningTextSanitizer.string(from: visiblePortion)
+                    if !provisionalReasoning.isEmpty {
+                        message.setIfChanged(\.reasoning, to: provisionalReasoning)
+                    }
+                    message.setIfChanged(\.text, to: "")
+                    message.setIfChanged(\.finalAnswer, to: sourcesBlock.isEmpty ? nil : sourcesBlock)
+                    return
+                }
+
+                message.completeReasoningCapture()
+                message.setIfChanged(\.streamingReasoningPhase, to: .finalAnswer)
+                message.setIfChanged(\.postToolReasoningStartCloseTagCount, to: nil)
+            }
+
             let parsed = if isToolSession {
                 Self.parseReasoningResponseForSearchSessionText(visiblePortion)
             } else {
                 parseReasoningResponse(visiblePortion)
             }
 
-            if isToolSession && !finalize {
-                if phase == .postToolReasoning {
-                    let closeTagCount = Self.reasoningCloseTagCount(in: visiblePortion)
-                    let boundaryCount = message.postToolReasoningStartCloseTagCount ?? closeTagCount
-                    if closeTagCount <= boundaryCount {
-                        let provisionalReasoning = ReasoningTextSanitizer.string(from: visiblePortion)
-                        if !provisionalReasoning.isEmpty {
-                            message.reasoning = provisionalReasoning
-                        }
-                        message.text = ""
-                        message.finalAnswer = sourcesBlock.isEmpty ? nil : sourcesBlock
-                        return
-                    }
-
-                    message.completeReasoningCapture()
-                    message.streamingReasoningPhase = .finalAnswer
-                    message.postToolReasoningStartCloseTagCount = nil
-                }
-            }
-
             // Always update reasoning if present
             if let reasoning = parsed.reasoning {
-                message.reasoning = reasoning
-                // Structured steps are persisted once. Re-parsing and JSON
-                // encoding the entire reasoning buffer on every streamed frame
-                // creates quadratic work and unstable step identities.
-                if finalize {
-                    message.updateReasoningSteps()
-                }
+                message.setIfChanged(\.reasoning, to: reasoning)
             }
 
             // Only update final answer (and visible text) when we actually have one
             if let answer = parsed.finalAnswer {
                 // Prepend hidden sources (if any) into finalAnswer so UI can find them
-                let stored = sourcesBlock + answer
-                message.finalAnswer = stored
-                message.text = answer // Keep raw visible text for non-reasoning fallbacks
+                message.setIfChanged(\.finalAnswer, to: sourcesBlock + answer)
+                message.setIfChanged(\.text, to: answer) // Keep raw visible text for non-reasoning fallbacks
                 message.completeReasoningCapture()
-                message.streamingReasoningPhase = .finalAnswer
-                message.postToolReasoningStartCloseTagCount = nil
+                message.setIfChanged(\.streamingReasoningPhase, to: .finalAnswer)
+                message.setIfChanged(\.postToolReasoningStartCloseTagCount, to: nil)
             } else {
                 // While only reasoning is present, keep the visible text empty or last known final answer
                 if parsed.reasoning == nil && visiblePortion.contains("<thinking>") {
                     // Keep raw text for UI fallback parsing
-                    message.text = visiblePortion
+                    message.setIfChanged(\.text, to: visiblePortion)
                 } else if parsed.reasoning == nil && !visiblePortion.isEmpty {
                     // No reasoning detected, but we have content (likely an error message or plain text)
                     // Store it directly in text so it's visible
-                    message.text = visiblePortion
+                    message.setIfChanged(\.text, to: visiblePortion)
                 } else {
                     // Extract visible text from finalAnswer (if any) without sources
-                    if let currentFinal = message.finalAnswer {
-                        message.text = currentFinal.removingSourcesBlocks()
-                    } else {
-                        message.text = ""
-                    }
+                    message.setIfChanged(\.text, to: message.finalAnswer?.removingSourcesBlocks() ?? "")
                 }
                 // If we have sources already but no final answer yet, ensure they're retained in finalAnswer
                 if chosenSources != nil && (message.finalAnswer ?? "").isEmpty {
-                    message.finalAnswer = sourcesBlock
+                    message.setIfChanged(\.finalAnswer, to: sourcesBlock)
                 }
             }
         } else {
             // Non-reasoning: prepend hidden sources into the stored text so UI can extract and show button
-            let stored = sourcesBlock + visiblePortion
-            message.text = stored
+            message.setIfChanged(\.text, to: sourcesBlock + visiblePortion)
         }
     }
+
+    /// Cheap check before running the sources regex over the whole output.
+    private static func containsSourcesTag(_ text: String) -> Bool {
+        text.range(of: "<sources>", options: .caseInsensitive) != nil
+    }
 }
+

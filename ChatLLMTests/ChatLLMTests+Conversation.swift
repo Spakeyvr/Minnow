@@ -61,11 +61,7 @@ extension ChatLLMTests {
     }
 
     @Test func attachmentCleanupKeepsFilesOfSavedChatsOnly() throws {
-        let container = try ModelContainer(
-            for: Schema([Conversation.self, ChatLLM.Message.self, MessageAttachment.self]),
-            configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
-        )
-        let context = ModelContext(container)
+        let context = try makeContext()
         func chat(_ fileName: String) -> (Conversation, MessageAttachment) {
             let conversation = Conversation(title: fileName)
             context.insert(conversation)
@@ -201,22 +197,6 @@ extension ChatLLMTests {
         message.searchInvocationsJSON = "{not json"
 
         #expect(message.searchInvocations == nil)
-    }
-
-    @Test func reasoningStepsRoundTripThroughJSON() {
-        let message = Message(role: .assistant, text: "", order: 0)
-        let steps = [
-            ReasoningStep(stepNumber: 1, title: "Read", content: "Read the question."),
-            ReasoningStep(stepNumber: 2, title: nil, content: "Answer it.")
-        ]
-        message.reasoningSteps = steps
-
-        #expect(message.reasoningSteps?.map(\.stepNumber) == [1, 2])
-        #expect(message.reasoningSteps?.map(\.content) == ["Read the question.", "Answer it."])
-        #expect(message.reasoningSteps?[1].title == nil)
-
-        message.reasoningSteps = nil
-        #expect(message.reasoningSteps == nil)
     }
 
     // MARK: - Conversation

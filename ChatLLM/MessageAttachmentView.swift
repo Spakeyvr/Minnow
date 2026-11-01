@@ -49,9 +49,9 @@ struct FullscreenAttachmentImageView: View {
 struct FullscreenImageView: View {
     let image: UIImage
     @Binding var isPresented: Bool
-    
+
     @State private var dragOffset: CGSize = .zero
-    
+
     var body: some View {
         // Read the safe area here, outside the sliding page: SwiftUI shrinks the safe
         // area of an offset view, so the page's black background stopped covering
@@ -60,17 +60,16 @@ struct FullscreenImageView: View {
             let insets = proxy.safeAreaInsets
             ZStack(alignment: .top) {
                 Color.black
-                
+
                 // The Zoomable View
                 // The dismiss drag runs on the scroll view itself. A SwiftUI DragGesture
                 // here had to wait for the scroll view's double-tap recognizer to fail,
                 // so the image stuck for a moment and then jumped to the finger.
                 ZoomableScrollView(
                     onDismissDragChanged: { translation in
-                        // Only allow dragging down
-                        if translation.height > 0 {
-                            dragOffset = translation
-                        }
+                        // Only the downward part moves the page, so dragging back
+                        // above the start point returns it to rest.
+                        dragOffset = Self.dismissDragOffset(for: translation)
                     },
                     onDismissDragEnded: { translation in
                         if translation.height > 150 {
@@ -87,7 +86,7 @@ struct FullscreenImageView: View {
                         .aspectRatio(contentMode: .fit)
                 }
                 .padding(insets)
-                
+
                 // Custom toolbar overlay
                 FullscreenToolbar(image: image, isPresented: $isPresented)
                     .padding(.top, insets.top)
@@ -98,6 +97,11 @@ struct FullscreenImageView: View {
             // The background, image and buttons slide down together as one page.
             .offset(y: dragOffset.height)
         }
+    }
+
+    /// The page offset for a dismiss drag: vertical only, and never above rest.
+    static func dismissDragOffset(for translation: CGSize) -> CGSize {
+        CGSize(width: 0, height: max(0, translation.height))
     }
 
     /// Finishes the swipe from where the finger let go, then removes the cover
@@ -167,7 +171,7 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
     let content: Content
     var onDismissDragChanged: (CGSize) -> Void
     var onDismissDragEnded: (CGSize) -> Void
-    
+
     init(
         onDismissDragChanged: @escaping (CGSize) -> Void,
         onDismissDragEnded: @escaping (CGSize) -> Void,
@@ -177,9 +181,9 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         self.onDismissDragEnded = onDismissDragEnded
         self.content = content()
     }
-    
+
     func makeUIView(context: Context) -> UIScrollView {
-        let scrollView = UIScrollView()
+        let scrollView = HostingScrollView(hostingController: context.coordinator.hostingController)
         scrollView.delegate = context.coordinator
         scrollView.maximumZoomScale = 4.0
         scrollView.minimumZoomScale = 1.0
@@ -187,13 +191,14 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.showsVerticalScrollIndicator = false
         scrollView.backgroundColor = .clear
-        
-        let hostedView = context.coordinator.hostingController.view!
-        hostedView.translatesAutoresizingMaskIntoConstraints = true
-        hostedView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        hostedView.backgroundColor = .clear
-        
-        scrollView.addSubview(hostedView)
+
+        if let hostedView = context.coordinator.hostingController.view {
+            hostedView.translatesAutoresizingMaskIntoConstraints = true
+            hostedView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            hostedView.backgroundColor = .clear
+            scrollView.addSubview(hostedView)
+            context.coordinator.zoomView = hostedView
+        }
 
         let doubleTap = UITapGestureRecognizer(
             target: context.coordinator,
@@ -211,30 +216,79 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
         context.coordinator.updateAccessibilityValue(for: scrollView)
         return scrollView
     }
-    
+
     func updateUIView(_ uiView: UIScrollView, context: Context) {
         context.coordinator.hostingController.rootView = content
         context.coordinator.onDismissDragChanged = onDismissDragChanged
         context.coordinator.onDismissDragEnded = onDismissDragEnded
     }
-    
+
     func makeCoordinator() -> Coordinator {
         Coordinator(hostingController: UIHostingController(rootView: content))
     }
-    
+
+    static func dismantleUIView(_ uiView: UIScrollView, coordinator: Coordinator) {
+        (uiView as? HostingScrollView)?.detachHostingController()
+    }
+
+    /// Adds the hosting controller as a child of the presenting view controller
+    /// while on screen, so traits and safe areas reach the hosted image.
+    final class HostingScrollView: UIScrollView {
+        private let hostingController: UIViewController
+
+        init(hostingController: UIViewController) {
+            self.hostingController = hostingController
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) is not supported")
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard window != nil else {
+                detachHostingController()
+                return
+            }
+            guard hostingController.parent == nil, let parent = enclosingViewController else { return }
+            parent.addChild(hostingController)
+            hostingController.didMove(toParent: parent)
+        }
+
+        func detachHostingController() {
+            guard hostingController.parent != nil else { return }
+            hostingController.willMove(toParent: nil)
+            hostingController.removeFromParent()
+        }
+
+        private var enclosingViewController: UIViewController? {
+            var responder = next
+            while let current = responder {
+                if let viewController = current as? UIViewController { return viewController }
+                responder = current.next
+            }
+            return nil
+        }
+    }
+
     class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
         var hostingController: UIHostingController<Content>
         var onDismissDragChanged: (CGSize) -> Void = { _ in }
         var onDismissDragEnded: (CGSize) -> Void = { _ in }
-        
+        /// The hosted image, which is what zooms. Held directly rather than found
+        /// among the scroll view's subviews, where UIKit may add its own.
+        weak var zoomView: UIView?
+
         init(hostingController: UIHostingController<Content>) {
             self.hostingController = hostingController
         }
-        
+
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
-            return scrollView.subviews.first
+            zoomView
         }
-        
+
         /// Like Photos: double-tap zooms in on the tapped spot, or back out when zoomed.
         @objc func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
             guard let scrollView = recognizer.view as? UIScrollView else { return }
@@ -289,15 +343,86 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
 
         func scrollViewDidZoom(_ scrollView: UIScrollView) {
             updateAccessibilityValue(for: scrollView)
-            guard let view = scrollView.subviews.first else { return }
-            
+            guard let view = zoomView else { return }
+
             let offsetX = max((scrollView.bounds.width - view.frame.width) * 0.5, 0)
             let offsetY = max((scrollView.bounds.height - view.frame.height) * 0.5, 0)
-            
+
             view.center = CGPoint(
                 x: scrollView.contentSize.width * 0.5 + offsetX,
                 y: scrollView.contentSize.height * 0.5 + offsetY
             )
         }
+    }
+}
+
+// MARK: - Compact image preview in chat bubbles
+
+struct MessageImageAttachmentView: View {
+    let attachment: MessageAttachment
+    @State private var image: UIImage?
+    @State private var isLoading = true
+    @State private var showFullscreen = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let image = image {
+                Button {
+                    showFullscreen = true
+                } label: {
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(maxWidth: 240, maxHeight: 180)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Attached image")
+                .accessibilityHint("Opens the image full screen.")
+            } else if isLoading {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.secondary.opacity(0.1))
+                    .frame(width: 240, height: 180)
+                    .overlay {
+                        ProgressView()
+                    }
+            } else {
+                HStack(spacing: 6) {
+                    Image(systemName: "photo.badge.exclamationmark")
+                        .foregroundStyle(.secondary)
+                    Text("Image unavailable")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(8)
+                .background(Color.secondary.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .task {
+            await loadImage()
+        }
+        // A full-screen cover, not a sheet: the viewer has its own drag-to-dismiss,
+        // and its backdrop fades to reveal the chat while dragging.
+        .fullScreenCover(isPresented: $showFullscreen) {
+            FullscreenAttachmentImageView(
+                attachment: attachment,
+                isPresented: $showFullscreen
+            )
+            .presentationBackground(.clear)
+        }
+    }
+
+    private func loadImage() async {
+        isLoading = true
+        image = await DiskBackedImageLoader.loadThumbnail(
+            at: attachment.actualFileURL,
+            maxPixelSize: 720
+        )
+        isLoading = false
     }
 }

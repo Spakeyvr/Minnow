@@ -1,5 +1,5 @@
 //
-//  ChatInputView.swift
+//  NavigationTitleView.swift
 //  ChatLLM
 //
 //  Created by Nevio on 10/24/25.
@@ -7,64 +7,10 @@
 
 import SwiftUI
 
-// MARK: - Enhanced composer view
+// MARK: - Navigation title component
 
-struct ComposerView: View {
-    @Binding var text: String
-    let placeholder: String
-    let focusRequest: Int
-    let isEditing: Bool
-    let canSend: Bool
-    let isGenerating: Bool
-    let onSend: () -> Void
-    let onStop: () -> Void
-    let onCancelEditing: () -> Void
-    let onCamera: () -> Void
-    let onPhotosPicker: () -> Void
-    let onFileImporter: () -> Void
-    var imageInputAvailable: Bool = true
-    @Binding var forceSearch: Bool
-    var searchAvailable: Bool = true
-    var searchUnavailableReason: String?
-    @Binding var disableToolCalls: Bool
-    var toolCallsLockedDisabled: Bool = false
-    @Binding var isReasoningEnabled: Bool
-    @Binding var isSmartReasoningEnabled: Bool
-    var reasoningAvailable: Bool = false
-    var reasoningRequired: Bool = false
-
-    var body: some View {
-        SimpleTextComposer(
-            text: $text,
-            placeholder: placeholder,
-            focusRequest: focusRequest,
-            isEditing: isEditing,
-            onSend: onSend,
-            onStop: onStop,
-            onCancelEditing: onCancelEditing,
-            canSend: canSend,
-            isGenerating: isGenerating,
-            onCamera: onCamera,
-            onPhotosPicker: onPhotosPicker,
-            onFileImporter: onFileImporter,
-            imageInputAvailable: imageInputAvailable,
-            forceSearch: $forceSearch,
-            searchAvailable: searchAvailable,
-            searchUnavailableReason: searchUnavailableReason,
-            disableToolCalls: $disableToolCalls,
-            toolCallsLockedDisabled: toolCallsLockedDisabled,
-            isReasoningEnabled: $isReasoningEnabled,
-            isSmartReasoningEnabled: $isSmartReasoningEnabled,
-            reasoningAvailable: reasoningAvailable,
-            reasoningRequired: reasoningRequired
-        )
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Message composer")
-    }
-}
-
-// MARK: - Navigation title component - Liquid Glass & Centered Fix
-
+/// The chat's model name in the navigation bar. Before the first message it is a menu
+/// for choosing the model; afterwards the model is locked and the title is plain.
 struct NavigationTitleView: View {
     @Environment(\.locale) private var locale
     let hasMessages: Bool
@@ -134,6 +80,7 @@ struct NavigationTitleView: View {
             } label: {
                 modelCapsule(interactive: true)
             }
+            .accessibilityHint(Text("Choose the model for this chat."))
             .menuOrder(.fixed)
             .sheet(isPresented: $showModelManagement) {
                 ModelSelectionView()

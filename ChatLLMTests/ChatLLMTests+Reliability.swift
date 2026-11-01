@@ -6,8 +6,8 @@ import SwiftData
 extension ChatLLMTests {
     @Test func independentFixturesDoNotShareBackendPreferencesOrModelStorage() throws {
         let other = ChatTestEnvironment()
-        testEnvironment.defaults.set("mlx", forKey: "selectedLLMBackend")
-        testEnvironment.defaults.set(true, forKey: "disableToolCalls")
+        testEnvironment.defaults.set("mlx", forKey: AppSettingsKeys.selectedLLMBackend)
+        testEnvironment.defaults.set(true, forKey: AppSettingsKeys.disableToolCalls)
         testEnvironment.bridge.selectedBackend = .mlx
         let models = testEnvironment.directory.appendingPathComponent("Models")
         try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
@@ -95,8 +95,11 @@ extension ChatLLMTests {
                               conversation: viewModel.conversation, isFinal: true)
         viewModel.conversation.messages = [message]
         viewModel.scheduleRegeneration(messageID: message.id, instruction: nil)
+        let scheduled = try #require(viewModel.scheduledRegenerationTask)
         viewModel.deactivate()
-        try await Task.sleep(for: .milliseconds(350))
+        #expect(viewModel.scheduledRegenerationTask == nil)
+        // The cancelled task returns without regenerating once its delay is interrupted.
+        await scheduled.value
         await viewModel.send(userText: "Late action")
         await viewModel.regenerateAfterAssistant(messageID: message.id)
         #expect(generator.request == nil)
@@ -127,7 +130,8 @@ extension ChatLLMTests {
         let gate = FoundationModelsGate()
         try await gate.acquire()
         let waiter = Task { try await gate.acquire() }
-        await Task.yield()
+        // Cancel only once the waiter is queued, so the queued path is what's tested.
+        try await waitUntilAsync { await gate.waiterCount == 1 }
         waiter.cancel()
         let viewModel = try makeViewModel()
         let cancelled = try await viewModel.withTimeout(.seconds(1)) {

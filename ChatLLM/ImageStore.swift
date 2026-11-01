@@ -16,6 +16,13 @@ actor ImageStore {
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ChatLLM", category: "ImageStore")
     private let nativeInferenceMaxDimension: CGFloat = 336
     private let cleanupProtectionWindow: TimeInterval = 15
+    private let attachmentsDirectory: URL
+
+    /// Stores attachments in `attachmentsDirectory`. The app uses `shared`, which
+    /// writes to `Documents/Attachments`; tests pass a temporary directory.
+    init(attachmentsDirectory: URL = MessageAttachment.attachmentsDirectory) {
+        self.attachmentsDirectory = attachmentsDirectory
+    }
 
     struct ImageMetrics: Sendable {
         let width: Int
@@ -49,11 +56,10 @@ actor ImageStore {
             throw NSError(domain: "ImageStore", code: -1, userInfo: [NSLocalizedDescriptionKey: String(localized: "JPEG encoding failed", bundle: .appLocalized)])
         }
         
-        let dir = try directory()
-        let url = dir.appendingPathComponent(UUID().uuidString).appendingPathExtension("jpg")
-        
+        let url = attachmentsDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("jpg")
+
         do {
-            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            try write(data, to: url)
             logger.info("Image saved: \(url.lastPathComponent) (\(data.count) bytes)")
             return url
         } catch {
@@ -76,7 +82,7 @@ actor ImageStore {
         }
 
         let constrainedDimension = max(64, min(maxDimension, nativeInferenceMaxDimension))
-        let outputURL = try inferenceVariantURL(for: sourceURL, maxDimension: constrainedDimension)
+        let outputURL = inferenceVariantURL(for: sourceURL, maxDimension: constrainedDimension)
 
         if FileManager.default.fileExists(atPath: outputURL.path),
            let existing = metricsSync(at: outputURL),
@@ -92,7 +98,7 @@ actor ImageStore {
             )
         }
 
-        try rendered.data.write(to: outputURL, options: [.atomic, .completeFileProtection])
+        try write(rendered.data, to: outputURL)
         logger.info("Inference image ready \(outputURL.lastPathComponent, privacy: .public) [\(rendered.sourceWidth)x\(rendered.sourceHeight) -> \(rendered.outputWidth)x\(rendered.outputHeight)] (\(rendered.data.count) bytes)")
         return outputURL
     }
@@ -108,9 +114,12 @@ actor ImageStore {
         }
     }
 
-    func deleteInferenceVariant(for sourceURL: URL, maxDimension: CGFloat = 512) async {
+    /// Deletes the inference variant `saveInferenceVariant` made for `sourceURL`.
+    /// Variants are always saved at `nativeInferenceMaxDimension`, which is also
+    /// what cleanup expects, so that is the only size to delete.
+    func deleteInferenceVariant(for sourceURL: URL) async {
         do {
-            let url = try inferenceVariantURL(for: sourceURL, maxDimension: max(64, min(maxDimension, nativeInferenceMaxDimension)))
+            let url = inferenceVariantURL(for: sourceURL, maxDimension: nativeInferenceMaxDimension)
             if FileManager.default.fileExists(atPath: url.path) {
                 try FileManager.default.removeItem(at: url)
                 logger.debug("Deleted inference variant: \(url.lastPathComponent)")
@@ -126,8 +135,8 @@ actor ImageStore {
 
     /// Clean up orphaned image files that are no longer referenced
     func cleanupOrphanedFiles(referencedURLs: Set<URL>) async throws {
-        let canonicalDir = try directory()
-        let inferenceDir = try inferenceDirectory()
+        let canonicalDir = attachmentsDirectory
+        let inferenceDir = inferenceDirectory
         let fileManager = FileManager.default
 
         guard let canonicalContents = try? fileManager.contentsOfDirectory(at: canonicalDir, includingPropertiesForKeys: [.fileSizeKey]) else {
@@ -191,23 +200,27 @@ actor ImageStore {
         return Date().timeIntervalSince(freshestDate) >= cleanupProtectionWindow
     }
 
-    private func directory() throws -> URL {
-        let dir = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent("Attachments", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
-        return dir
+    private var inferenceDirectory: URL {
+        attachmentsDirectory.appending(path: "Inference", directoryHint: .isDirectory)
     }
 
-    private func inferenceDirectory() throws -> URL {
-        let dir = try directory().appendingPathComponent("Inference", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
-        return dir
+    /// Writes `data`, creating the parent directory only when the write fails
+    /// because it is missing (first save, or after the attachments were cleared),
+    /// instead of re-creating directories before every write.
+    private func write(_ data: Data, to url: URL) throws {
+        let options: Data.WritingOptions = [.atomic, .completeFileProtection]
+        do {
+            try data.write(to: url, options: options)
+        } catch {
+            let directory = url.deletingLastPathComponent()
+            guard !FileManager.default.fileExists(atPath: directory.path) else { throw error }
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
+            try data.write(to: url, options: options)
+        }
     }
 
-    private func inferenceVariantURL(for sourceURL: URL, maxDimension: CGFloat) throws -> URL {
-        let dir = try inferenceDirectory()
-        let fileName = inferenceFileName(for: sourceURL, maxDimension: maxDimension)
-        return dir.appendingPathComponent(fileName)
+    private func inferenceVariantURL(for sourceURL: URL, maxDimension: CGFloat) -> URL {
+        inferenceDirectory.appendingPathComponent(inferenceFileName(for: sourceURL, maxDimension: maxDimension))
     }
 
     private func inferenceFileName(for sourceURL: URL, maxDimension: CGFloat) -> String {
@@ -338,38 +351,17 @@ enum DiskBackedImageLoader {
     }()
 
     static func loadThumbnail(at url: URL, maxPixelSize: Int) async -> UIImage? {
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-
         let constrainedPixelSize = max(64, maxPixelSize)
         let cacheKey = "\(url.standardizedFileURL.path)#\(constrainedPixelSize)" as NSString
         if let cached = thumbnailCache.object(forKey: cacheKey) {
             return cached
         }
 
-        let thumbnail = await Task.detached(priority: .userInitiated) {
-            autoreleasepool { () -> UIImage? in
-                let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
-                guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
-                    return nil
-                }
-                let thumbnailOptions: [CFString: Any] = [
-                    kCGImageSourceCreateThumbnailFromImageAlways: true,
-                    kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceThumbnailMaxPixelSize: constrainedPixelSize,
-                    kCGImageSourceShouldCacheImmediately: true
-                ]
-                guard let cgImage = CGImageSourceCreateThumbnailAtIndex(
-                    source,
-                    0,
-                    thumbnailOptions as CFDictionary
-                ) else {
-                    return nil
-                }
-                return UIImage(cgImage: cgImage)
-            }
-        }.value
-
-        if let thumbnail, let cgImage = thumbnail.cgImage {
+        // A missing file makes ImageIO return nil, so no separate existence check.
+        guard let thumbnail = await decodeThumbnail(at: url, maxPixelSize: constrainedPixelSize) else {
+            return nil
+        }
+        if let cgImage = thumbnail.cgImage {
             thumbnailCache.setObject(
                 thumbnail,
                 forKey: cacheKey,
@@ -379,14 +371,42 @@ enum DiskBackedImageLoader {
         return thumbnail
     }
 
+    /// Loads and fully decodes the image away from the main actor, so the first
+    /// draw doesn't decode the JPEG on the main thread.
     static func loadImage(at url: URL) async -> UIImage? {
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        await decodeImage(at: url)
+    }
 
-        return await Task.detached(priority: .userInitiated) {
-            autoreleasepool {
-                guard let data = try? Data(contentsOf: url) else { return nil }
-                return UIImage(data: data)
+    @concurrent nonisolated
+    private static func decodeThumbnail(at url: URL, maxPixelSize: Int) async -> UIImage? {
+        autoreleasepool { () -> UIImage? in
+            let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
+                return nil
             }
-        }.value
+            let thumbnailOptions: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                thumbnailOptions as CFDictionary
+            ) else {
+                return nil
+            }
+            return UIImage(cgImage: cgImage)
+        }
+    }
+
+    @concurrent nonisolated
+    private static func decodeImage(at url: URL) async -> UIImage? {
+        autoreleasepool { () -> UIImage? in
+            guard let data = try? Data(contentsOf: url),
+                  let image = UIImage(data: data) else { return nil }
+            return image.preparingForDisplay() ?? image
+        }
     }
 }

@@ -62,19 +62,14 @@ extension ChatLLMTests {
         }
     }
 
-    @Test func languageSwitchUpdatesEagerStringsWithoutChangingChatPreferences() throws {
-        let defaults = UserDefaults.standard
-        let previousLanguage = defaults.object(forKey: AppSettingsKeys.appLanguage)
-        defer { defaults.set(previousLanguage, forKey: AppSettingsKeys.appLanguage) }
-        let preferences = defaults.string(forKey: AppSettingsKeys.chatPreferences)
-
-        defaults.set("de", forKey: AppSettingsKeys.appLanguage)
+    @Test func languageSwitchUpdatesEagerStrings() {
+        // The test environment restores English for the next test.
+        AppLanguage.overrideCurrent(with: .german)
         #expect(Strings.thinking == "Denke nach…")
         #expect(TavilySearchError.invalidAPIKey.errorDescription == "Der Tavily-API-Schlüssel fehlt oder ist ungültig.")
-        defaults.set("es", forKey: AppSettingsKeys.appLanguage)
+        AppLanguage.overrideCurrent(with: .spanish)
         #expect(Strings.thinking == "Pensando…")
         #expect(TavilySearchError.invalidAPIKey.errorDescription == "La clave de API de Tavily falta o no es válida.")
-        #expect(defaults.string(forKey: AppSettingsKeys.chatPreferences) == preferences)
     }
 
     @Test func chatExportIsWrittenInTheAppLanguage() {

@@ -7,42 +7,20 @@
 
 import Foundation
 import SwiftData
+import Synchronization
 
-// Pre-compiled regexes used in Message display and parsing (compiled once at app launch)
+// Pre-compiled regexes used to clean message text for display (compiled once at app launch)
 // swiftlint:disable force_try
-private let _thinkingTagRegex = try! NSRegularExpression(
+nonisolated private let _thinkingTagRegex = try! NSRegularExpression(
     pattern: #"<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>\s*"#, options: [.caseInsensitive])
-private let _answerTagDisplayRegex = try! NSRegularExpression(
+nonisolated private let _answerTagDisplayRegex = try! NSRegularExpression(
     pattern: #"<answer>([\s\S]*?)</answer>"#, options: [.caseInsensitive])
-private let _hiddenImageContextRegex = try! NSRegularExpression(
+nonisolated private let _hiddenImageContextRegex = try! NSRegularExpression(
     pattern: #"\[HIDDEN_IMAGE_CONTEXT\].*?\[/HIDDEN_IMAGE_CONTEXT\]"#, options: [.dotMatchesLineSeparators])
-private let _imageAnalysisBlockRegex = try! NSRegularExpression(
+nonisolated private let _imageAnalysisBlockRegex = try! NSRegularExpression(
     pattern: #"--- Image Analysis Data ---.*?(?:--- End Image Analysis ---\s*User's question:\s*|--- User Question ---\n?)"#,
     options: [.dotMatchesLineSeparators])
-private let _numberedStepRegex = try! NSRegularExpression(
-    pattern: #"(?:^|\n)(?:(?:Step\s*)?(\d+)[:.\)]\s*([^\n]*)\n?)"#, options: [.caseInsensitive])
-private let _headingStepRegex = try! NSRegularExpression(
-    pattern: #"(?:^|\n)(#{1,3})\s+([^\n]+)\n"#, options: [])
 // swiftlint:enable force_try
-
-// MARK: - Reasoning Step Model
-
-/// Represents a single step in the Chain of Thought reasoning process
-struct ReasoningStep: Codable, Sendable, Identifiable {
-    var id: UUID
-    var stepNumber: Int
-    var title: String?
-    var content: String
-    var timestamp: Date
-    
-    init(id: UUID = UUID(), stepNumber: Int, title: String? = nil, content: String, timestamp: Date = Date()) {
-        self.id = id
-        self.stepNumber = stepNumber
-        self.title = title
-        self.content = content
-        self.timestamp = timestamp
-    }
-}
 
 enum ReasoningStreamPhase: String, Sendable {
     case initialThinking
@@ -50,7 +28,7 @@ enum ReasoningStreamPhase: String, Sendable {
     case finalAnswer
 }
 
-enum MessageRole: String, Codable, CaseIterable, Sendable {
+nonisolated enum MessageRole: String, Codable, CaseIterable, Sendable {
     case system
     case user
     case assistant
@@ -60,15 +38,13 @@ enum MessageRole: String, Codable, CaseIterable, Sendable {
 
 @Model
 final class Message {
-    // Performance: Order properties by frequency of access and memory alignment
     @Attribute(.unique) var id: UUID
     var order: Int
     var role: MessageRole
     var isFinal: Bool
     var isReasoningMode: Bool
     var createdAt: Date
-    
-    // String properties grouped together for better memory locality
+
     var text: String
     var reasoning: String?
     var finalAnswer: String?
@@ -99,32 +75,11 @@ final class Message {
     // All web search invocations stored as JSON for SwiftData compatibility
     var searchInvocationsJSON: String?
 
-    // Chain of Thought steps stored as JSON string for SwiftData compatibility
+    // Retired: structured reasoning steps were parsed and saved here but never
+    // shown. The column stays so existing stores open without a migration, and
+    // regeneration clears whatever an older build left behind.
     private var reasoningStepsJSON: String?
-    
-    // Computed property to access reasoning steps
-    @Transient
-    var reasoningSteps: [ReasoningStep]? {
-        get {
-            guard let json = reasoningStepsJSON else { return nil }
-            if json == _cachedReasoningStepsJSON { return _cachedReasoningSteps }
-            _cachedReasoningStepsJSON = json
-            _cachedReasoningSteps = try? JSONDecoder().decode([ReasoningStep].self, from: Data(json.utf8))
-            return _cachedReasoningSteps
-        }
-        set {
-            if let steps = newValue,
-               let data = try? JSONEncoder().encode(steps),
-               let json = String(data: data, encoding: .utf8) {
-                reasoningStepsJSON = json
-            } else {
-                reasoningStepsJSON = nil
-            }
-            _cachedReasoningStepsJSON = nil
-            _cachedReasoningSteps = nil
-        }
-    }
-    
+
     // Computed property to access search invocations
     @Transient
     var searchInvocations: [SearchInvocation]? {
@@ -151,133 +106,73 @@ final class Message {
         }
     }
 
-    // Relationships last to minimize impact on property access
     @Relationship var conversation: Conversation?
     @Relationship(deleteRule: .cascade, inverse: \MessageAttachment.message)
     var attachments: [MessageAttachment]
 
-    // MARK: - Performance-optimized computed properties
-    
-    // Cached values for expensive computations
-    @Transient private var _cachedDisplayText: String?
-    @Transient private var _cachedContentLength: Int?
-    @Transient private var _lastDisplayTextHash: Int?
-    @Transient private var _lastContentLengthHash: Int?
+    // MARK: - Display text
+
+    // Cleaned display text for the current display source, recomputed only when
+    // the source changes. Not persisted.
+    @Transient private var _displayTextCache: MessageDisplayTextCache?
 
     // Cached decoded values for JSON-backed computed properties (not persisted)
-    @Transient private var _cachedReasoningSteps: [ReasoningStep]?
-    @Transient private var _cachedReasoningStepsJSON: String?
     @Transient private var _cachedSearchInvocations: [SearchInvocation]?
     @Transient private var _cachedSearchInvocationsJSON: String?
-    
+
     var isAssistant: Bool { role.isAssistant }
-    
-    /// Optimized text content access for display with caching
-    var displayText: String {
-        // CRITICAL FIX (Bug #3): Include ALL relevant fields in hash, not just text and finalAnswer
-        let textHash = text.hashValue
-        let reasoningHash = reasoning?.hashValue ?? 0
-        let finalAnswerHash = finalAnswer?.hashValue ?? 0
-        // Use a more collision-resistant combination than XOR
-        let combinedHash = textHash &+ (reasoningHash &* 31) &+ (finalAnswerHash &* 17)
-        
-        if let cached = _cachedDisplayText, _lastDisplayTextHash == combinedHash {
-            return cached
-        }
-        
-        var result: String
+
+    /// The stored text the display text is cleaned from: in reasoning mode an
+    /// assistant reply shows `finalAnswer` when there is one, even if it only
+    /// holds sources, which the UI extracts from it.
+    var displaySource: String {
         if isReasoningMode && isAssistant {
-            // In reasoning mode, always prefer finalAnswer if it exists, even if it only contains sources
-            // The UI will properly extract and display sources from finalAnswer
-            result = finalAnswer ?? text
-        } else {
-            result = text
+            return finalAnswer ?? text
         }
-        
-        // CRITICAL FIX (Bug #6): Always strip raw <thinking> tags from display
-        let lowercasedResult = result.lowercased()
-        if lowercasedResult.contains("<thinking>") || lowercasedResult.contains("<think>") {
-            let range = NSRange(result.startIndex..<result.endIndex, in: result)
-            result = _thinkingTagRegex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if result.lowercased().hasPrefix("final answer:") {
-                result = String(result.dropFirst("final answer:".count))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-
-        // Strip <answer> tags from display (Qwen3 sometimes wraps responses in these)
-        if result.contains("<answer>") || result.contains("<Answer>") || result.contains("<ANSWER>") {
-            let range = NSRange(result.startIndex..<result.endIndex, in: result)
-            result = _answerTagDisplayRegex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "$1")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        // Strip hidden image analysis context from display
-        if result.contains("[HIDDEN_IMAGE_CONTEXT]") {
-            let range = NSRange(result.startIndex..<result.endIndex, in: result)
-            result = _hiddenImageContextRegex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        // Strip "--- Image Analysis Data ---" block from display
-        if result.contains("--- Image Analysis Data ---") {
-            let range = NSRange(result.startIndex..<result.endIndex, in: result)
-            result = _imageAnalysisBlockRegex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if result.hasSuffix("Please respond based on the image analysis data above.") {
-                result = result.replacingOccurrences(of: "\n\nPlease respond based on the image analysis data above.", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-        
-        _cachedDisplayText = result
-        _lastDisplayTextHash = combinedHash
-        return result
+        return text
     }
 
+    /// The reply as shown in the bubble, without reasoning tags or hidden image context.
+    var displayText: String {
+        displayTextCache().displayText
+    }
+
+    /// The display text without `<sources>` blocks, as copied, shared and searched.
     var userVisibleText: String {
-        displayText.removingSourcesBlocks()
-    }
-    
-    /// Optimized content length calculation with caching
-    /// CRITICAL FIX (Bug 3 & 6): Use consistent hash and return display-visible length
-    var contentLength: Int {
-        // Use the SAME hash calculation as displayText for consistency
-        let textHash = text.hashValue
-        let reasoningHash = reasoning?.hashValue ?? 0
-        let finalAnswerHash = finalAnswer?.hashValue ?? 0
-        // Match displayText's hash calculation exactly
-        let combinedHash = textHash &+ (reasoningHash &* 31) &+ (finalAnswerHash &* 17)
-        
-        if let cached = _cachedContentLength, _lastContentLengthHash == combinedHash {
-            return cached
+        var cache = displayTextCache()
+        if let userVisibleText = cache.userVisibleText {
+            return userVisibleText
         }
-        
-        // CRITICAL FIX (Bug 6): Return display-visible length, not raw storage length
-        // This ensures UI sizing is based on what the user actually sees
-        let result = displayText.count
-        _cachedContentLength = result
-        _lastContentLengthHash = combinedHash
-        return result
+        let userVisibleText = cache.displayText.removingSourcesBlocks()
+        cache.userVisibleText = userVisibleText
+        _displayTextCache = cache
+        return userVisibleText
     }
-    
-    /// Fast isEmpty check without string operations
-    var hasContent: Bool {
-        !text.isEmpty || !(reasoning?.isEmpty ?? true) || !(finalAnswer?.isEmpty ?? true)
+
+    /// Returns the cache for the current display source, rebuilding it when the
+    /// source changed. Comparing the source by value catches every write to
+    /// `text`, `finalAnswer`, `isReasoningMode` and `role`, and is effectively
+    /// free while the string storage is unchanged.
+    private func displayTextCache() -> MessageDisplayTextCache {
+        let source = displaySource
+        if let cache = _displayTextCache, cache.source == source {
+            return cache
+        }
+        let cache = MessageDisplayTextCache(
+            source: source,
+            displayText: MessageDisplayTextCleaner.displayText(from: source)
+        )
+        _displayTextCache = cache
+        return cache
     }
-    
-    /// Invalidate caches when content changes
+
+    /// Drops the cached display text so the next read rebuilds it.
     private func invalidateCache() {
-        _cachedDisplayText = nil
-        _cachedContentLength = nil
-        _lastDisplayTextHash = nil
-        _lastContentLengthHash = nil
+        _displayTextCache = nil
     }
-    
-    // MARK: - Optimized Initializers
-    
-    /// Primary initializer with performance optimizations
+
+    // MARK: - Initializer
+
     init(
         id: UUID = UUID(),
         role: MessageRole,
@@ -291,7 +186,6 @@ final class Message {
         reasoning: String? = nil,
         finalAnswer: String? = nil,
         isReasoningMode: Bool = false,
-        reasoningSteps: [ReasoningStep]? = nil,
         searchQuery: String? = nil,
         requiresWebSearch: Bool? = nil,
         rawText: String? = nil,
@@ -323,11 +217,10 @@ final class Message {
         self.reasoningCompletedAt = reasoningCompletedAt
         self.conversation = conversation
         self.attachments = attachments
-        self.reasoningSteps = reasoningSteps
     }
 }
 
-// MARK: - Performance Extensions
+// MARK: - Generation capture and regeneration
 
 extension Message {
     nonisolated static let maximumCapturedRawTextCharacters = 32_768
@@ -380,12 +273,12 @@ extension Message {
     }
 
     private func clearGenerationMetrics() {
-        generationPromptTokenCount = nil
-        generationCachedPromptTokenCount = nil
-        generationPromptTime = nil
-        generationOutputTokenCount = nil
-        generationDecodeTime = nil
-        generationTimeToFirstToken = nil
+        setIfChanged(\.generationPromptTokenCount, to: nil)
+        setIfChanged(\.generationCachedPromptTokenCount, to: nil)
+        setIfChanged(\.generationPromptTime, to: nil)
+        setIfChanged(\.generationOutputTokenCount, to: nil)
+        setIfChanged(\.generationDecodeTime, to: nil)
+        setIfChanged(\.generationTimeToFirstToken, to: nil)
     }
 
     var estimatedOutputTokenCount: Int? {
@@ -532,46 +425,37 @@ extension Message {
 
     /// Reset message state before regeneration so the next run starts clean.
     func resetForRegeneration() {
-        let preservedRequiresWebSearch = requiresWebSearch
         let preservedForcedSearchQuery = requiresWebSearch == true ? searchQuery : nil
 
-        // Only clear if needed
-        let needsReset = !self.text.isEmpty ||
-                        self.reasoning != nil ||
-            self.finalAnswer != nil ||
-            self.isFinal ||
-            self.generationError != nil ||
-            self.rawText != nil ||
-            self.generationBackend != nil ||
-            self.generationModelName != nil ||
-            self.generationStartedAt != nil ||
-            self.generationCompletedAt != nil ||
-            self.reasoningStartedAt != nil ||
-            self.reasoningCompletedAt != nil ||
-            self.generationOutputTokenCount != nil ||
-            self.searchInvocations != nil ||
-            self.searchQuery != nil
+        // Always reset every field: a partial "is anything set?" check drifted from
+        // the fields cleared here. Each write is skipped when the value is already
+        // clean, so a new turn's untouched placeholder is not dirtied and saved again.
+        invalidateCache()
+        setIfChanged(\.text, to: "")
+        setIfChanged(\.reasoning, to: nil)
+        setIfChanged(\.finalAnswer, to: nil)
+        setIfChanged(\.isFinal, to: false)
+        setIfChanged(\.generationError, to: nil)
+        setIfChanged(\.rawText, to: nil)
+        setIfChanged(\.generationBackend, to: nil)
+        setIfChanged(\.generationModelName, to: nil)
+        setIfChanged(\.generationStartedAt, to: nil)
+        setIfChanged(\.generationCompletedAt, to: nil)
+        setIfChanged(\.reasoningStartedAt, to: nil)
+        setIfChanged(\.reasoningCompletedAt, to: nil)
+        clearGenerationMetrics()
+        setIfChanged(\.streamingReasoningPhase, to: nil)
+        setIfChanged(\.postToolReasoningStartCloseTagCount, to: nil)
+        if reasoningStepsJSON != nil { reasoningStepsJSON = nil }
+        setIfChanged(\.searchInvocationsJSON, to: nil)
+        setIfChanged(\.searchQuery, to: preservedForcedSearchQuery)
+    }
 
-        if needsReset {
-            invalidateCache()
-            self.text = ""
-            self.reasoning = nil
-            self.finalAnswer = nil
-            self.isFinal = false
-            self.generationError = nil
-            self.rawText = nil
-            self.generationBackend = nil
-            self.generationModelName = nil
-            self.generationStartedAt = nil
-            self.generationCompletedAt = nil
-            self.reasoningStartedAt = nil
-            self.reasoningCompletedAt = nil
-            self.clearGenerationMetrics()
-            self.streamingReasoningPhase = nil
-            self.postToolReasoningStartCloseTagCount = nil
-            self.searchInvocations = nil
-            self.requiresWebSearch = preservedRequiresWebSearch
-            self.searchQuery = preservedForcedSearchQuery
+    /// Writes `value` only when it differs from the stored one, so SwiftData
+    /// does not record a change for an identical value.
+    func setIfChanged<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<Message, Value>, to value: Value) {
+        if self[keyPath: keyPath] != value {
+            self[keyPath: keyPath] = value
         }
     }
 }
@@ -621,34 +505,111 @@ enum ThoughtDurationFormatter {
     }
 }
 
-enum ReasoningTextSanitizer {
-    nonisolated static func string(from text: String) -> String {
+nonisolated enum ReasoningTextSanitizer {
+    nonisolated private struct Entry {
+        let input: String
+        let output: String
+    }
+
+    // The reasoning view asks for the same text several times per render, and
+    // streaming asks once per frame, so the last result is reused while the
+    // input is unchanged.
+    private static let lastResult = Mutex<Entry?>(nil)
+
+    static func string(from text: String) -> String {
+        if let cached = lastResult.withLock({ $0 }), cached.input == text {
+            return cached.output
+        }
+        let output = sanitize(text)
+        lastResult.withLock { $0 = Entry(input: text, output: output) }
+        return output
+    }
+
+    private static func sanitize(_ text: String) -> String {
         // Tags separate reasoning passes around tool calls, so they become
         // paragraph breaks; dropping them would fuse two steps into one.
-        let stripped = text
-            .replacingOccurrences(of: "<think>", with: "\n\n", options: .caseInsensitive)
-            .replacingOccurrences(of: "</think>", with: "\n\n", options: .caseInsensitive)
-            .replacingOccurrences(of: "<thinking>", with: "\n\n", options: .caseInsensitive)
-            .replacingOccurrences(of: "</thinking>", with: "\n\n", options: .caseInsensitive)
-        return stripped
-            .replacingOccurrences(
-                of: #"\n[ \t]*\n(?:[ \t]*\n)+"#,
-                with: "\n\n",
-                options: .regularExpression
+        var result = text
+        if result.range(of: "think", options: .caseInsensitive) != nil {
+            result = SharedRegexes.reasoningTag.stringByReplacingMatches(
+                in: result,
+                options: [],
+                range: NSRange(result.startIndex..., in: result),
+                withTemplate: "\n\n"
             )
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        result = SharedRegexes.blankLineRun.stringByReplacingMatches(
+            in: result,
+            options: [],
+            range: NSRange(result.startIndex..., in: result),
+            withTemplate: "\n\n"
+        )
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
+/// A message's cleaned display text, keyed by the source it was cleaned from.
+private struct MessageDisplayTextCache {
+    let source: String
+    let displayText: String
+    var userVisibleText: String?
+}
 
+/// Turns stored message text into what the reader sees. Pure and nonisolated,
+/// so exports can clean text away from the main actor.
+nonisolated enum MessageDisplayTextCleaner {
+    static func displayText(from source: String) -> String {
+        var result = source
 
-// MARK: - Identity-based Equality (SwiftData handles Hashable automatically)
+        // Raw reasoning tags never reach the bubble.
+        if result.range(of: "<think>", options: .caseInsensitive) != nil
+            || result.range(of: "<thinking>", options: .caseInsensitive) != nil {
+            result = replacing(_thinkingTagRegex, in: result, with: "")
+            if let prefix = result.range(of: "final answer:", options: [.caseInsensitive, .anchored]) {
+                result = String(result[prefix.upperBound...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
 
-// Note: SwiftData's @Model macro automatically provides Sendable conformance
+        // Qwen3 sometimes wraps responses in <answer> tags.
+        if result.range(of: "<answer>", options: .caseInsensitive) != nil {
+            result = replacing(_answerTagDisplayRegex, in: result, with: "$1")
+        }
+
+        // Hidden image analysis context is for the model only.
+        if result.contains("[HIDDEN_IMAGE_CONTEXT]") {
+            result = replacing(_hiddenImageContextRegex, in: result, with: "")
+        }
+
+        if result.contains("--- Image Analysis Data ---") {
+            result = replacing(_imageAnalysisBlockRegex, in: result, with: "")
+            if result.hasSuffix("Please respond based on the image analysis data above.") {
+                result = result.replacingOccurrences(of: "\n\nPlease respond based on the image analysis data above.", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        return result
+    }
+
+    /// The display text without `<sources>` blocks.
+    static func userVisibleText(from source: String) -> String {
+        displayText(from: source).removingSourcesBlocks()
+    }
+
+    private static func replacing(_ regex: NSRegularExpression, in text: String, with template: String) -> String {
+        regex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: NSRange(text.startIndex..., in: text),
+            withTemplate: template
+        )
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
 
 // MARK: - Collection helpers for Message
 
-extension Array where Element == Message {
+nonisolated extension Array where Element == Message {
     /// Returns messages sorted by `order`, breaking ties with `createdAt`.
     var sortedByOrder: [Message] {
         self.sorted {
@@ -657,149 +618,5 @@ extension Array where Element == Message {
             }
             return $0.order < $1.order
         }
-    }
-}
-
-// MARK: - Chain of Thought Parsing
-
-extension Message {
-    /// Parse reasoning text into structured CoT steps
-    /// Supports multiple formats:
-    /// - Numbered lists (1., 2., Step 1:, etc.)
-    /// - Titled sections (## Step, ### Analysis, etc.)
-    /// - Paragraph-based reasoning (split by double newlines)
-    func parseReasoningIntoSteps(from reasoningText: String) -> [ReasoningStep] {
-        let trimmed = reasoningText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        
-        var steps: [ReasoningStep] = []
-        var currentStepNumber = 1
-        
-        // Strategy 1: Try to detect numbered steps (1., 2., Step 1:, etc.)
-        let regex = _numberedStepRegex
-        do {
-            let nsString = trimmed as NSString
-            let matches = regex.matches(in: trimmed, options: [], range: NSRange(location: 0, length: nsString.length))
-            
-            if !matches.isEmpty {
-                for (index, match) in matches.enumerated() {
-                    let fullRange = match.range
-                    let titleRange = match.numberOfRanges > 2 ? match.range(at: 2) : NSRange(location: 0, length: 0)
-                    
-                    // Extract content between this match and the next (or end of string)
-                    let contentStart = fullRange.location + fullRange.length
-                    let contentEnd = index < matches.count - 1 ? matches[index + 1].range.location : nsString.length
-                    
-                    var content = ""
-                    if contentStart < contentEnd {
-                        content = nsString.substring(with: NSRange(location: contentStart, length: contentEnd - contentStart))
-                            .trimmingCharacters(in: .whitespacesAndNewlines)
-                    }
-                    
-                    // Get title if present
-                    let title = titleRange.length > 0 ? nsString.substring(with: titleRange).trimmingCharacters(in: .whitespacesAndNewlines) : nil
-                    
-                    // If content is empty, the title might actually be the content
-                    if content.isEmpty && !(title?.isEmpty ?? true) {
-                        content = title ?? ""
-                    }
-                    
-                    if !content.isEmpty {
-                        steps.append(ReasoningStep(
-                            stepNumber: currentStepNumber,
-                            title: title?.isEmpty == false ? title : nil,
-                            content: content
-                        ))
-                        currentStepNumber += 1
-                    }
-                }
-                
-                if !steps.isEmpty {
-                    return steps
-                }
-            }
-        }
-        
-        // Strategy 2: Try markdown headings (## Step, ### Analysis)
-        do {
-            let regex = _headingStepRegex
-            let nsString = trimmed as NSString
-            let matches = regex.matches(in: trimmed, options: [], range: NSRange(location: 0, length: nsString.length))
-            
-            if !matches.isEmpty {
-                for (index, match) in matches.enumerated() {
-                    let fullRange = match.range
-                    let titleRange = match.range(at: 2)
-                    
-                    let title = nsString.substring(with: titleRange)
-                    
-                    // Extract content until next heading
-                    let contentStart = fullRange.location + fullRange.length
-                    let contentEnd = index < matches.count - 1 ? matches[index + 1].range.location : nsString.length
-                    
-                    var content = ""
-                    if contentStart < contentEnd {
-                        content = nsString.substring(with: NSRange(location: contentStart, length: contentEnd - contentStart))
-                            .trimmingCharacters(in: .whitespacesAndNewlines)
-                    }
-                    
-                    if !content.isEmpty {
-                        steps.append(ReasoningStep(
-                            stepNumber: currentStepNumber,
-                            title: title,
-                            content: content
-                        ))
-                        currentStepNumber += 1
-                    }
-                }
-                
-                if !steps.isEmpty {
-                    return steps
-                }
-            }
-        }
-        
-        // Strategy 3: Split by double newlines (paragraphs)
-        let paragraphs = trimmed.components(separatedBy: "\n\n")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        
-        if paragraphs.count > 1 {
-            for paragraph in paragraphs {
-                // Try to extract a title from the first line if it looks like one
-                let lines = paragraph.components(separatedBy: "\n")
-                let firstLine = lines.first ?? ""
-                
-                // Check if first line is short and looks like a title (ends with : or is < 60 chars and one line)
-                let isTitle = firstLine.count < 60 && (firstLine.hasSuffix(":") || lines.count > 1)
-                
-                let title = isTitle ? firstLine.trimmingCharacters(in: CharacterSet(charactersIn: ":")) : nil
-                let content = isTitle && lines.count > 1 ? lines.dropFirst().joined(separator: "\n") : paragraph
-                
-                steps.append(ReasoningStep(
-                    stepNumber: currentStepNumber,
-                    title: title,
-                    content: content
-                ))
-                currentStepNumber += 1
-            }
-            
-            if !steps.isEmpty {
-                return steps
-            }
-        }
-        
-        // Fallback: Single step with all content
-        return [ReasoningStep(stepNumber: 1, title: nil, content: trimmed)]
-    }
-    
-    /// Update or create reasoning steps from current reasoning text
-    func updateReasoningSteps() {
-        guard let reasoningText = self.reasoning, !reasoningText.isEmpty else {
-            self.reasoningSteps = nil
-            return
-        }
-        
-        self.reasoningSteps = parseReasoningIntoSteps(from: reasoningText)
     }
 }

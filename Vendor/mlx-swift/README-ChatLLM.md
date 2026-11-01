@@ -73,6 +73,13 @@ Decode throughput patches in `mlx-swift-lm`:
   Upstream kept the whole prompt dense until the first decode. Chunks past the
   limit attend to compressed history. The limit is saved as an optional 15th `metaState` value,
   and 14-value prompt caches still load.
+- the presence penalty keeps a vocabulary-sized penalty vector instead of an
+  index list that grew (and was copied) every token, so its per-token cost is
+  one scatter and one subtraction regardless of output length;
+- `TokenIterator` evaluates each cache layer's backing buffers
+  (`innerState()`) after every step instead of `state`, whose getters build
+  new slice arrays per layer per token, and RotorQuant's exact-tail storage
+  check compares dimensions before building shape arrays.
 
 Prompt-cache patches in `mlx-swift-lm`:
 
@@ -81,7 +88,17 @@ Prompt-cache patches in `mlx-swift-lm`:
   (a reused chat session or a restored prompt prefix) was embedded at the wrong
   M-RoPE positions while decode used absolute ones;
 - `ChatSession` can start from an existing KV cache, which ChatLLM uses to
-  restore a saved system-prompt prefix (`MLXPromptPrefixCache`).
+  restore a saved system-prompt prefix (`MLXPromptPrefixCache`);
+- `loadPromptCache` applies a RotorQuant layer's `metaState` before its
+  `state`, so its quantizers are built once with the saved bit widths instead
+  of first with the defaults.
+
+Cancellation patches in `mlx-swift-lm`:
+
+- the chunked text prefill in `LLMModel.prepare` and Qwen 3.5's `prepare`
+  calls `Task.checkCancellation()` between chunks. Stopping a response during
+  a long prefill otherwise kept the GPU and the model container busy for
+  seconds; the prompt-prefix prefill and prefill tuning stop the same way.
 
 Regression coverage lives in `ChatLLMTests+LFM.swift`; the opt-in real model tests
 and their simulator setup are documented in the root README. Reassess these

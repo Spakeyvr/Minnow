@@ -2220,6 +2220,18 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
         // Without this, a full exact tail grows one token at a time until the
         // first flush, briefly overlapping each old and replacement allocation.
         let capacity = max(exactBufferSize + exactFlushSlack, exactCapacity, exactCount, 1)
+        // ChatLLM patch: this runs on every ingest; compare dimensions before
+        // building shape arrays for the common already-allocated case.
+        if let exactKeys, let exactValues,
+           exactKeys.dtype == dtype, exactValues.dtype == dtype,
+           exactKeys.ndim == 4, exactValues.ndim == 4,
+           exactKeys.dim(0) == batch, exactKeys.dim(1) == kvHeads,
+           exactKeys.dim(2) == capacity, exactKeys.dim(3) == keyDimension,
+           exactValues.dim(0) == batch, exactValues.dim(1) == kvHeads,
+           exactValues.dim(2) == capacity, exactValues.dim(3) == valueDimension
+        {
+            return
+        }
         let desiredKeyShape = [batch, kvHeads, capacity, keyDimension]
         let desiredValueShape = [batch, kvHeads, capacity, valueDimension]
         let needsAllocation =
@@ -3254,9 +3266,17 @@ public func loadPromptCache(
             throw KVCacheError(message: "Unknown cache class: \(className)")
         }
 
-        cache.state = cacheData[i]
-        if i < cacheInfo.count {
+        if cache is RotorQuantKVCache, i < cacheInfo.count {
+            // ChatLLM patch: metaState carries the saved bit widths and buffer
+            // sizes. Applying it first builds the quantizers once with them;
+            // setting state first built them with the defaults, then rebuilt.
             cache.metaState = cacheInfo[i]
+            cache.state = cacheData[i]
+        } else {
+            cache.state = cacheData[i]
+            if i < cacheInfo.count {
+                cache.metaState = cacheInfo[i]
+            }
         }
         caches.append(cache)
     }

@@ -1,5 +1,22 @@
 import SwiftUI
 
+/// Ranges and starting values for the on-device model settings. The stored preferences
+/// are clamped to the same limits, so keep the two in step.
+nonisolated enum MLXTuningLimits {
+    static let minimumContextWindowTokens = 512
+    static let contextWindowStep = 512
+    static let outputTokenRange = 512...1024
+    static let outputTokenStep = 32
+    /// Where Maximum Output starts when Unlimited Output is turned off.
+    static let defaultCappedOutputTokens = 1024
+    /// 1.0 means no penalty, which the Reduce Repetition toggle represents as off.
+    static let noRepetitionPenalty = 1.0
+    static let repetitionPenaltyRange = 1.05...1.5
+    static let repetitionPenaltyStep = 0.05
+    /// Where the penalty starts when Reduce Repetition is turned on.
+    static let defaultRepetitionPenalty = 1.1
+}
+
 struct AdvancedSettingsView: View {
     @Binding var settings: AppSettingsDraft
     @State private var showingResetConfirmation = false
@@ -44,7 +61,19 @@ private struct MLXSettingsView: View {
     @Binding var settings: AppSettingsDraft
     @Environment(\.locale) private var locale
 
-    private var deviceMaximum: Int { MLXDeviceSupportProfile.current.maxContextWindowTokens }
+    private enum RotorQuantCopy {
+        static var infoMessage: String { String(localized: "Enabled by default for persistent MLX text and image chats, RotorQuant uses IsoQuant block rotations with 4-bit keys, 4-bit values, exact prefill buffering, and per-layer deterministic rotation parameters to reduce memory use. Tool and low-memory turns use safer uncompressed or bounded caches.", bundle: .appLocalized) }
+        static var accessibilityHint: String { String(localized: "Enabled by default for supported persistent MLX text and image chats. Tool and low-memory turns use safer cache modes.", bundle: .appLocalized) }
+        static var experimentalTitle: String { String(localized: "RotorQuant Experimental", bundle: .appLocalized) }
+        static var experimentalMessage: String { String(localized: "RotorQuant is very early and in beta. It can reduce KV-cache memory, but speed and stability are still being tuned.", bundle: .appLocalized) }
+    }
+
+    @ObservedObject private var modelBackendBridge = ModelBackendBridge.shared
+
+    private var selectedModel: MLXModelManager.MLXModelInfo? { modelBackendBridge.selectedLocalModel }
+    private var deviceMaximum: Int {
+        MLXDeviceSupportProfile.current.contextWindowSettingMaximum(selectedModel: selectedModel)
+    }
     private var sliderMaximum: Int {
         settings.overrideContextWindowLimit
             ? max(deviceMaximum, UserDefaults.mlxDeveloperContextWindowMaximum)
@@ -52,37 +81,51 @@ private struct MLXSettingsView: View {
     }
     private var contextTokens: Binding<Double> {
         Binding(
-            get: { Double(settings.mlxContextWindowTokens <= 0
-                          ? deviceMaximum : min(max(settings.mlxContextWindowTokens, 512), sliderMaximum)) },
+            get: {
+                Double(settings.mlxContextWindowTokens <= 0
+                       ? deviceMaximum
+                       : min(max(settings.mlxContextWindowTokens, MLXTuningLimits.minimumContextWindowTokens), sliderMaximum))
+            },
             set: { settings.mlxContextWindowTokens = Int($0.rounded()) }
         )
     }
     private var outputTokens: Binding<Double> {
-        Binding(get: { Double(max(512, settings.mlxMaxOutputTokens)) },
+        Binding(get: { Double(max(MLXTuningLimits.outputTokenRange.lowerBound, settings.mlxMaxOutputTokens)) },
                 set: { settings.mlxMaxOutputTokens = Int($0.rounded()) })
+    }
+    private var outputTokenSliderRange: ClosedRange<Double> {
+        Double(MLXTuningLimits.outputTokenRange.lowerBound)...Double(MLXTuningLimits.outputTokenRange.upperBound)
     }
 
     var body: some View {
         Form {
             Section {
                 LabeledContent("Context Window", value: String(localized: "\(Int(contextTokens.wrappedValue)) tokens", bundle: .appLocalized, locale: locale))
-                Slider(value: contextTokens, in: 512...Double(sliderMaximum), step: 512) {
+                Slider(
+                    value: contextTokens,
+                    in: Double(MLXTuningLimits.minimumContextWindowTokens)...Double(sliderMaximum),
+                    step: Double(MLXTuningLimits.contextWindowStep)
+                ) {
                     Text("Context Window")
                 }
                 .accessibilityValue("\(Int(contextTokens.wrappedValue)) tokens")
             } footer: {
-                Text("How much conversation a local MLX model can use. This device supports up to \(deviceMaximum) tokens.")
+                if let selectedModel {
+                    Text("How much conversation a local MLX model can use. On this device, \(selectedModel.displayName) supports up to \(deviceMaximum) tokens.")
+                } else {
+                    Text("How much conversation a local MLX model can use. This device supports up to \(deviceMaximum) tokens.")
+                }
             }
 
             Section {
                 Toggle("Unlimited Output", isOn: Binding(
                     get: { settings.mlxMaxOutputTokens == 0 },
-                    set: { settings.mlxMaxOutputTokens = $0 ? 0 : 1024 }
+                    set: { settings.mlxMaxOutputTokens = $0 ? 0 : MLXTuningLimits.defaultCappedOutputTokens }
                 ))
                 .accessibilityIdentifier("settings.unlimitedOutput")
                 if settings.mlxMaxOutputTokens != 0 {
                     LabeledContent("Maximum Output", value: String(localized: "\(settings.mlxMaxOutputTokens) tokens", bundle: .appLocalized, locale: locale))
-                    Slider(value: outputTokens, in: 512...1024, step: 32) {
+                    Slider(value: outputTokens, in: outputTokenSliderRange, step: Double(MLXTuningLimits.outputTokenStep)) {
                         Text("Maximum Output")
                     }
                     .accessibilityValue("\(settings.mlxMaxOutputTokens) tokens")
@@ -93,13 +136,21 @@ private struct MLXSettingsView: View {
 
             Section {
                 Toggle("Reduce Repetition", isOn: Binding(
-                    get: { settings.mlxRepetitionPenalty > 1 },
-                    set: { settings.mlxRepetitionPenalty = $0 ? 1.1 : 1 }
+                    get: { settings.mlxRepetitionPenalty > MLXTuningLimits.noRepetitionPenalty },
+                    set: {
+                        settings.mlxRepetitionPenalty = $0
+                            ? MLXTuningLimits.defaultRepetitionPenalty
+                            : MLXTuningLimits.noRepetitionPenalty
+                    }
                 ))
                 .accessibilityIdentifier("settings.reduceRepetition")
-                if settings.mlxRepetitionPenalty > 1 {
+                if settings.mlxRepetitionPenalty > MLXTuningLimits.noRepetitionPenalty {
                     LabeledContent("Penalty", value: settings.mlxRepetitionPenalty.formatted(.number.precision(.fractionLength(2))))
-                    Slider(value: $settings.mlxRepetitionPenalty, in: 1.05...1.5, step: 0.05) {
+                    Slider(
+                        value: $settings.mlxRepetitionPenalty,
+                        in: MLXTuningLimits.repetitionPenaltyRange,
+                        step: MLXTuningLimits.repetitionPenaltyStep
+                    ) {
                         Text("Repetition Penalty")
                     }
                 }
@@ -109,17 +160,17 @@ private struct MLXSettingsView: View {
 
             Section {
                 Toggle("RotorQuant", isOn: $settings.mlxEnableRotorQuant)
-                    .accessibilityHint(SettingsSheet.mlxRotorQuantAccessibilityHint)
+                    .accessibilityHint(RotorQuantCopy.accessibilityHint)
                     .accessibilityIdentifier("settings.rotorQuant")
                 NavigationLink("About RotorQuant") {
                     Form {
                         Section {
-                            Text(SettingsSheet.mlxRotorQuantExperimentalMessage)
+                            Text(RotorQuantCopy.experimentalMessage)
                         } header: {
-                            Text(SettingsSheet.mlxRotorQuantExperimentalTitle)
+                            Text(RotorQuantCopy.experimentalTitle)
                         }
                         Section("How It Works") {
-                            Text(SettingsSheet.mlxRotorQuantInfoMessage)
+                            Text(RotorQuantCopy.infoMessage)
                         }
                     }
                     .navigationTitle("RotorQuant")
@@ -137,6 +188,7 @@ private struct MLXSettingsView: View {
 }
 
 private struct DeveloperSettingsView: View {
+    @Environment(\.locale) private var locale
     @Binding var settings: AppSettingsDraft
     @State private var showingMemoryWarning = false
 
@@ -164,7 +216,7 @@ private struct DeveloperSettingsView: View {
                 Toggle("Raise Context Window Limit", isOn: $settings.overrideContextWindowLimit)
                     .accessibilityIdentifier("settings.overrideContextWindowLimit")
             } footer: {
-                Text("Let the On-Device Models context window go up to 32,768 tokens, past this device’s limit. Large contexts can run out of memory and crash the app.")
+                Text("Let the On-Device Models context window go up to \(UserDefaults.mlxDeveloperContextWindowMaximum.formatted(.number.locale(locale))) tokens, past this device’s limit. Large contexts can run out of memory and crash the app.")
             }
             Section {
                 Toggle("Keep Full KV Cache", isOn: $settings.forcePersistentKVCache)

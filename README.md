@@ -40,6 +40,8 @@ open ChatLLM.xcodeproj
 
 Select the `ChatLLM` scheme, pick a simulator or connected device, and run. Xcode resolves the Swift packages automatically.
 
+The shared scheme runs the app in the Release configuration on purpose: MLX inference is far too slow in an unoptimized Debug build. Tests still build in Debug. To step through code in the debugger or reach `#if DEBUG` paths such as the Markdown rendering preview, duplicate the scheme as a personal (not shared) scheme and set its Run action to Debug, rather than changing the shared one.
+
 To check that the app compiles from the command line:
 
 ```bash

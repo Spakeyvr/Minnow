@@ -25,6 +25,21 @@ nonisolated enum AppSettingsKeys {
     static let hasCompletedOnboarding = "hasCompletedOnboarding"
 }
 
+/// Defaults that differ from the type's zero value, shared by `AppSettingsDraft.defaults()`
+/// and the `UserDefaults` accessors that read a setting directly.
+nonisolated enum AppSettingsDefaults {
+    static let appAppearance = "system"
+    static let enableHaptics = true
+    static let messageFontSize = 16.0
+    /// 0 leaves the output length to the model.
+    static let mlxMaxOutputTokens = 0
+    /// 0 uses the device maximum.
+    static let mlxContextWindowTokens = 0
+    static let mlxEnableRotorQuant = true
+    static let mlxRepetitionPenalty = 1.0
+    static let autoDeleteDays = 30
+}
+
 struct AppSettingsDraft: Equatable {
     var chatPreferences: String
     var appAppearance: String
@@ -46,50 +61,92 @@ struct AppSettingsDraft: Equatable {
     var overrideContextWindowLimit: Bool
     var disableToolCalls: Bool
 
+    /// Saved settings, with `defaults()` filling in every value that was never saved.
     static func load(from defaults: UserDefaults = .standard) -> Self {
-        Self(
-            chatPreferences: defaults.string(forKey: AppSettingsKeys.chatPreferences)
-                ?? defaults.string(forKey: AppSettingsKeys.legacyDefaultSystemPrompt)
-                ?? "",
-            appAppearance: defaults.string(forKey: AppSettingsKeys.appAppearance) ?? "system",
-            appLanguage: AppLanguage.resolve(defaults.string(forKey: AppSettingsKeys.appLanguage) ?? "en").rawValue,
-            tavilyApiKey: TavilyAPIKeyStore.currentKey(userDefaults: defaults) ?? "",
-            sendOnReturn: defaults.sendOnReturn,
-            enableHaptics: defaults.enableHapticsPreference,
-            reasoningModeDefault: defaults.bool(forKey: AppSettingsKeys.reasoningModeDefault),
-            messageFontSize: defaults.object(forKey: AppSettingsKeys.messageFontSize) as? Double ?? 16.0,
-            mlxMaxOutputTokens: defaults.mlxMaxOutputTokens,
-            mlxContextWindowTokens: defaults.object(forKey: AppSettingsKeys.mlxContextWindowTokens) != nil
-                ? defaults.integer(forKey: AppSettingsKeys.mlxContextWindowTokens)
-                : 0,
-            mlxEnableRotorQuant: defaults.mlxEnableRotorQuant,
-            mlxRepetitionPenalty: defaults.mlxRepetitionPenalty,
-            autoDeleteOldChats: defaults.bool(forKey: AppSettingsKeys.autoDeleteOldChats),
-            autoDeleteDays: defaults.object(forKey: AppSettingsKeys.autoDeleteDays) as? Int ?? 30,
-            developerModeEnabled: defaults.bool(forKey: AppSettingsKeys.developerModeEnabled),
-            disableRAMPrecautions: defaults.bool(forKey: AppSettingsKeys.disableRAMPrecautions),
-            forcePersistentKVCache: defaults.bool(forKey: AppSettingsKeys.forcePersistentKVCache),
-            overrideContextWindowLimit: defaults.bool(forKey: AppSettingsKeys.overrideContextWindowLimit),
-            disableToolCalls: defaults.bool(forKey: AppSettingsKeys.disableToolCalls)
-        )
+        func ifSaved<Value>(_ key: String, _ read: () -> Value) -> Value? {
+            defaults.object(forKey: key) == nil ? nil : read()
+        }
+
+        var draft = Self.defaults()
+        if let chatPreferences = defaults.string(forKey: AppSettingsKeys.chatPreferences)
+            ?? defaults.string(forKey: AppSettingsKeys.legacyDefaultSystemPrompt) {
+            draft.chatPreferences = chatPreferences
+        }
+        if let appAppearance = defaults.string(forKey: AppSettingsKeys.appAppearance) {
+            draft.appAppearance = appAppearance
+        }
+        if let appLanguage = defaults.string(forKey: AppSettingsKeys.appLanguage) {
+            draft.appLanguage = AppLanguage.resolve(appLanguage).rawValue
+        }
+        if let tavilyApiKey = TavilyAPIKeyStore.currentKey(userDefaults: defaults) {
+            draft.tavilyApiKey = tavilyApiKey
+        }
+        // The typed accessors also clamp saved values into their valid range.
+        if let value = ifSaved(AppSettingsKeys.sendOnReturn, { defaults.sendOnReturn }) {
+            draft.sendOnReturn = value
+        }
+        if let value = ifSaved(AppSettingsKeys.enableHaptics, { defaults.enableHapticsPreference }) {
+            draft.enableHaptics = value
+        }
+        if let value = ifSaved(AppSettingsKeys.reasoningModeDefault, { defaults.bool(forKey: AppSettingsKeys.reasoningModeDefault) }) {
+            draft.reasoningModeDefault = value
+        }
+        if let value = ifSaved(AppSettingsKeys.messageFontSize, { defaults.double(forKey: AppSettingsKeys.messageFontSize) }) {
+            draft.messageFontSize = value
+        }
+        if let value = ifSaved(AppSettingsKeys.mlxMaxOutputTokens, { defaults.mlxMaxOutputTokens }) {
+            draft.mlxMaxOutputTokens = value
+        }
+        if let value = ifSaved(AppSettingsKeys.mlxContextWindowTokens, { defaults.integer(forKey: AppSettingsKeys.mlxContextWindowTokens) }) {
+            draft.mlxContextWindowTokens = value
+        }
+        if let value = ifSaved(AppSettingsKeys.mlxEnableRotorQuant, { defaults.mlxEnableRotorQuant }) {
+            draft.mlxEnableRotorQuant = value
+        }
+        if let value = ifSaved(AppSettingsKeys.mlxRepetitionPenalty, { defaults.mlxRepetitionPenalty }) {
+            draft.mlxRepetitionPenalty = value
+        }
+        if let value = ifSaved(AppSettingsKeys.autoDeleteOldChats, { defaults.bool(forKey: AppSettingsKeys.autoDeleteOldChats) }) {
+            draft.autoDeleteOldChats = value
+        }
+        if let value = ifSaved(AppSettingsKeys.autoDeleteDays, { defaults.integer(forKey: AppSettingsKeys.autoDeleteDays) }) {
+            draft.autoDeleteDays = value
+        }
+        if let value = ifSaved(AppSettingsKeys.developerModeEnabled, { defaults.bool(forKey: AppSettingsKeys.developerModeEnabled) }) {
+            draft.developerModeEnabled = value
+        }
+        if let value = ifSaved(AppSettingsKeys.disableRAMPrecautions, { defaults.bool(forKey: AppSettingsKeys.disableRAMPrecautions) }) {
+            draft.disableRAMPrecautions = value
+        }
+        if let value = ifSaved(AppSettingsKeys.forcePersistentKVCache, { defaults.bool(forKey: AppSettingsKeys.forcePersistentKVCache) }) {
+            draft.forcePersistentKVCache = value
+        }
+        if let value = ifSaved(AppSettingsKeys.overrideContextWindowLimit, { defaults.bool(forKey: AppSettingsKeys.overrideContextWindowLimit) }) {
+            draft.overrideContextWindowLimit = value
+        }
+        if let value = ifSaved(AppSettingsKeys.disableToolCalls, { defaults.disableToolCalls }) {
+            draft.disableToolCalls = value
+        }
+        return draft
     }
 
+    /// Every setting's value on a fresh install and after Reset All Settings.
     static func defaults() -> Self {
         Self(
             chatPreferences: "",
-            appAppearance: "system",
-            appLanguage: "en",
+            appAppearance: AppSettingsDefaults.appAppearance,
+            appLanguage: AppLanguage.systemDefault.rawValue,
             tavilyApiKey: "",
             sendOnReturn: false,
-            enableHaptics: true,
+            enableHaptics: AppSettingsDefaults.enableHaptics,
             reasoningModeDefault: false,
-            messageFontSize: 16.0,
-            mlxMaxOutputTokens: 0,
-            mlxContextWindowTokens: 0,
-            mlxEnableRotorQuant: true,
-            mlxRepetitionPenalty: 1.0,
+            messageFontSize: AppSettingsDefaults.messageFontSize,
+            mlxMaxOutputTokens: AppSettingsDefaults.mlxMaxOutputTokens,
+            mlxContextWindowTokens: AppSettingsDefaults.mlxContextWindowTokens,
+            mlxEnableRotorQuant: AppSettingsDefaults.mlxEnableRotorQuant,
+            mlxRepetitionPenalty: AppSettingsDefaults.mlxRepetitionPenalty,
             autoDeleteOldChats: false,
-            autoDeleteDays: 30,
+            autoDeleteDays: AppSettingsDefaults.autoDeleteDays,
             developerModeEnabled: false,
             disableRAMPrecautions: false,
             forcePersistentKVCache: false,
@@ -104,7 +161,16 @@ struct AppSettingsDraft: Equatable {
 
     // Live settings edits pass the prior snapshot so an unrelated preference
     // never rewrites credentials or overwrites values changed elsewhere.
-    func persist(to defaults: UserDefaults = .standard, comparedTo previous: Self? = nil) {
+    /// Returns false when the Tavily key could not be stored; every other setting is
+    /// saved regardless. `saveTavilyKey` stands in for the Keychain in tests.
+    @discardableResult
+    func persist(
+        to defaults: UserDefaults = .standard,
+        comparedTo previous: Self? = nil,
+        saveTavilyKey: (String, UserDefaults) -> Bool = { key, defaults in
+            TavilyAPIKeyStore.save(key, userDefaults: defaults)
+        }
+    ) -> Bool {
         if previous?.chatPreferences != chatPreferences || defaults.object(forKey: AppSettingsKeys.legacyDefaultSystemPrompt) != nil {
             defaults.set(chatPreferences, forKey: AppSettingsKeys.chatPreferences)
             defaults.removeObject(forKey: AppSettingsKeys.legacyDefaultSystemPrompt)
@@ -163,10 +229,18 @@ struct AppSettingsDraft: Equatable {
 
         let trimmedKey = tavilyApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard previous == nil || previous?.tavilyApiKey.trimmingCharacters(in: .whitespacesAndNewlines) != trimmedKey else {
-            return
+            return true
         }
         // An empty key clears the stored key.
-        TavilyAPIKeyStore.save(trimmedKey, userDefaults: defaults)
+        return saveTavilyKey(trimmedKey, defaults)
+    }
+
+    /// The draft to show after `persist` returned false: the Tavily key goes back to
+    /// the one still stored, so Settings never shows a key that wasn't saved.
+    func revertingTavilyKey(to previous: Self) -> Self {
+        var reverted = self
+        reverted.tavilyApiKey = previous.tavilyApiKey
+        return reverted
     }
 
 }
@@ -180,7 +254,7 @@ extension UserDefaults {
     var enableHapticsPreference: Bool {
         get {
             guard object(forKey: AppSettingsKeys.enableHaptics) != nil else {
-                return true
+                return AppSettingsDefaults.enableHaptics
             }
             return bool(forKey: AppSettingsKeys.enableHaptics)
         }

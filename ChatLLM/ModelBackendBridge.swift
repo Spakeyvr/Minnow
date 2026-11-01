@@ -31,8 +31,21 @@ class ModelBackendBridge: ObservableObject {
     /// Currently selected model ID (if using MLX backend)
     @Published var selectedModelID: String?
 
-    /// Model manager for MLX models
-    @Published var modelManager: MLXModelManager?
+    /// Model manager for MLX models. Always present; `modelManager` below is
+    /// an optional-typed view of it kept for existing call sites.
+    private(set) var mlxModelManager: MLXModelManager
+
+    /// Never nil. Assigning a manager (tests do) rebinds the bridge to it;
+    /// assigning nil is ignored.
+    var modelManager: MLXModelManager? {
+        get { mlxModelManager }
+        set {
+            guard let newValue, newValue !== mlxModelManager else { return }
+            objectWillChange.send()
+            mlxModelManager = newValue
+            bindManager(newValue)
+        }
+    }
 
     weak var activeConversation: Conversation?
 
@@ -59,7 +72,8 @@ class ModelBackendBridge: ObservableObject {
     /// Shared singleton instance for consistent state across the app
     static let shared = ModelBackendBridge()
 
-    private var cancellables = Set<AnyCancellable>()
+    /// Subscriptions to `mlxModelManager`, replaced when the manager is.
+    private var managerCancellables = Set<AnyCancellable>()
 
     private let defaults: UserDefaults
 
@@ -89,7 +103,17 @@ class ModelBackendBridge: ObservableObject {
         // Always create the manager so model availability can be checked
         // in the picker regardless of which backend is currently selected.
         let manager = modelManager ?? MLXModelManager(defaults: defaults)
-        self.modelManager = manager
+        self.mlxModelManager = manager
+        bindManager(manager)
+
+        // Only load if the user previously chose this backend.
+        if self.selectedBackend == .mlx {
+            manager.startLoading(modelID: self.selectedModelID, source: "bridge.init")
+        }
+    }
+
+    private func bindManager(_ manager: MLXModelManager) {
+        managerCancellables.removeAll()
 
         // Keep selectedModelID in sync with whatever model actually loads.
         manager.$currentModel
@@ -98,26 +122,41 @@ class ModelBackendBridge: ObservableObject {
             .sink { [weak self] id in
                 self?.selectedModelID = id
             }
-            .store(in: &cancellables)
+            .store(in: &managerCancellables)
 
         manager.downloadCompleted
             .receive(on: DispatchQueue.main)
             .sink { [weak self] id in
                 self?.loadDownloadedModelIfSelected(id)
             }
-            .store(in: &cancellables)
+            .store(in: &managerCancellables)
 
-        // Forward all modelManager @Published changes so views observing this bridge
-        // (e.g. NavigationTitleView) re-render when isLoading or pendingModelToLoad changes.
-        manager.objectWillChange
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.objectWillChange.send() }
-            .store(in: &cancellables)
+        // Forward only the manager state that views read through this bridge
+        // (model lists, load state, download state). Each `$property` fires
+        // in its `willSet` on the main actor, so the bridge's `objectWillChange`
+        // also arrives before the change, not a run-loop turn after it.
+        // `downloadProgress` is not forwarded: the views that show it observe
+        // the manager directly, so progress never re-renders every bridge view.
+        Publishers.MergeMany(Self.viewStateChanges(of: manager))
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &managerCancellables)
+    }
 
-        // Only load if the user previously chose this backend.
-        if self.selectedBackend == .mlx {
-            manager.startLoading(modelID: self.selectedModelID, source: "bridge.init")
+    private static func viewStateChanges(of manager: MLXModelManager) -> [AnyPublisher<Void, Never>] {
+        func changes<Value>(_ publisher: Published<Value>.Publisher) -> AnyPublisher<Void, Never> {
+            publisher.dropFirst().map { _ in () }.eraseToAnyPublisher()
         }
+        return [
+            changes(manager.$availableModels),
+            changes(manager.$currentModel),
+            changes(manager.$isLoading),
+            changes(manager.$loadError),
+            changes(manager.$pendingModelToLoad),
+            changes(manager.$isDownloading),
+            changes(manager.$activeDownloadModelID),
+            changes(manager.$downloadError),
+            changes(manager.$downloadErrorModelID)
+        ]
     }
 
     func bindConversation(_ conversation: Conversation?) {
@@ -164,16 +203,16 @@ class ModelBackendBridge: ObservableObject {
         case .foundationModels:
             let shouldResetPipelines =
                 selectedBackend != .foundationModels ||
-                modelManager?.currentModel != nil ||
-                modelManager?.isLoading == true
+                mlxModelManager.currentModel != nil ||
+                mlxModelManager.isLoading
             selectedBackend = .foundationModels
             defaults.set(backend.rawValue, forKey: AppSettingsKeys.selectedLLMBackend)
             persistSelectionToActiveConversation()
             guard shouldResetPipelines else { return }
             notifyPipelineReset(reason: "backend.foundationModels")
-            modelManager?.unloadAllModels()
+            mlxModelManager.unloadAllModels()
         case .mlx:
-            let modelIDToLoad = selectedModelID ?? modelManager?.availableModels.first(where: \.isAvailable)?.id
+            let modelIDToLoad = selectedModelID ?? mlxModelManager.availableModels.first(where: \.isAvailable)?.id
             guard let modelIDToLoad else {
                 selectedBackend = .mlx
                 defaults.set(backend.rawValue, forKey: AppSettingsKeys.selectedLLMBackend)
@@ -199,17 +238,17 @@ class ModelBackendBridge: ObservableObject {
 
     func switchToMLXModel(_ modelID: String, source: String = "unknown") {
         let modelID = Self.legacyModelIDMap[modelID] ?? modelID
-        guard let manager = modelManager,
-              let model = manager.model(withID: modelID) else {
-            modelManager?.unloadAllModels()
-            modelManager?.loadError = String(localized: "Selected MLX model '\(modelID)' is no longer known. Choose another model.", bundle: .appLocalized)
+        let manager = mlxModelManager
+        guard let model = manager.model(withID: modelID) else {
+            manager.unloadAllModels()
+            manager.reportLoadError(String(localized: "Selected MLX model '\(modelID)' is no longer known. Choose another model.", bundle: .appLocalized))
             return
         }
         guard model.isAvailable else {
             notifyPipelineReset(reason: "backend.mlx.unavailable.\(modelID)")
             manager.unloadAllModels()
-            manager.loadError = manager.availabilityIssue(for: model) ??
-                String(localized: "Model '\(model.displayName)' isn't downloaded yet. Download it in Manage Models before selecting it.", bundle: .appLocalized)
+            manager.reportLoadError(manager.availabilityIssue(for: model) ??
+                String(localized: "Model '\(model.displayName)' isn't downloaded yet. Download it in Manage Models before selecting it.", bundle: .appLocalized))
             return
         }
 
@@ -237,9 +276,8 @@ class ModelBackendBridge: ObservableObject {
     /// Intelligence when that's available, or back to choosing a model, rather than
     /// keeping a selection that can no longer reply.
     func deleteModel(_ model: MLXModelManager.MLXModelInfo) throws {
-        guard let manager = modelManager else { return }
         let wasSelected = selectedBackend == .mlx && selectedModelID == model.id
-        try manager.deleteModel(model)
+        try mlxModelManager.deleteModel(model)
         guard wasSelected else { return }
         if foundationModelsAvailable {
             selectBackend(.foundationModels, source: "model.deleted")
@@ -256,7 +294,7 @@ class ModelBackendBridge: ObservableObject {
     private func loadDownloadedModelIfSelected(_ modelID: String) {
         guard selectedBackend == .mlx,
               (selectedModelID ?? modelID) == modelID,
-              modelManager?.currentModel?.id != modelID else { return }
+              mlxModelManager.currentModel?.id != modelID else { return }
         switchToMLXModel(modelID, source: "download_complete")
     }
 
@@ -280,11 +318,8 @@ class ModelBackendBridge: ObservableObject {
 
     // MARK: - Model-Specific Features
 
-    /// Known model families that support reasoning/thinking mode.
-    /// Used as fallback when modelManager isn't available but a model ID is stored.
-    private static let knownReasoningPrefixes = ["qwen", "lfm2.5"]
-
-    /// Reasoning is only exposed for MLX models that support it.
+    /// Reasoning is only exposed for MLX models that support it. A stored ID
+    /// that matches no catalog model falls back to its model family.
     var reasoningAvailable: Bool {
         guard selectedBackend == .mlx else {
             return false
@@ -293,12 +328,17 @@ class ModelBackendBridge: ObservableObject {
             return model.supportsReasoning
         }
         guard let modelID = selectedModelID else { return false }
-        return Self.knownReasoningPrefixes.contains(where: { modelID.contains($0) })
+        return MLXModelManager.MLXModelInfo.Family(modelID: modelID).supportsReasoning
     }
 
     var reasoningRequired: Bool {
-        selectedBackend == .mlx &&
-            (selectedMLXModel?.requiresReasoning ?? (selectedModelID == "lfm2.5-2.6b-4bit"))
+        guard selectedBackend == .mlx else { return false }
+        if let model = selectedMLXModel {
+            return model.requiresReasoning
+        }
+        return selectedModelID.map {
+            MLXModelManager.MLXModelInfo.Family(modelID: $0).alwaysOpensThinkingBlock
+        } ?? false
     }
 
     var foundationModelsAvailable: Bool {
@@ -325,22 +365,27 @@ class ModelBackendBridge: ObservableObject {
     /// Get the current model's display name
     var currentModelDisplayName: String? {
         guard let modelID = selectedModelID else { return nil }
-        if let model = modelManager?.model(withID: modelID)
-            ?? modelManager?.currentModel.flatMap({ $0.id == modelID ? $0 : nil })
+        if let model = mlxModelManager.model(withID: modelID)
+            ?? mlxModelManager.currentModel.flatMap({ $0.id == modelID ? $0 : nil })
             ?? MLXModelManager.modelDefinitions.first(where: { $0.id == modelID }) {
             return model.displayName
         }
         return modelID
     }
 
+    /// The local model new messages go to, or nil while Apple Intelligence is selected.
+    var selectedLocalModel: MLXModelManager.MLXModelInfo? {
+        selectedBackend == .mlx ? selectedMLXModel : nil
+    }
+
     private var selectedMLXModel: MLXModelManager.MLXModelInfo? {
         if let modelID = selectedModelID {
-            if let current = modelManager?.currentModel, current.id == modelID {
+            if let current = mlxModelManager.currentModel, current.id == modelID {
                 return current
             }
-            return modelManager?.model(withID: modelID)
+            return mlxModelManager.model(withID: modelID)
         }
-        return modelManager?.currentModel
+        return mlxModelManager.currentModel
     }
 
     var toolCallsAvailableForCurrentBackend: Bool {
@@ -348,20 +393,19 @@ class ModelBackendBridge: ObservableObject {
         case .foundationModels:
             return true
         case .mlx:
-            guard let model = selectedMLXModel, let manager = modelManager else {
+            guard let model = selectedMLXModel else {
                 return false
             }
-            return manager.supportsToolCalls(for: model)
+            return mlxModelManager.supportsToolCalls(for: model)
         }
     }
 
     var toolCallAvailabilityIssueForCurrentBackend: String? {
         guard selectedBackend == .mlx,
-              let model = selectedMLXModel,
-              let manager = modelManager else {
+              let model = selectedMLXModel else {
             return nil
         }
-        return manager.toolCallIssue(for: model)
+        return mlxModelManager.toolCallIssue(for: model)
     }
 }
 
@@ -371,22 +415,26 @@ extension Notification.Name {
 
 // MARK: - UserDefaults Extension
 
+// The clamps share `MLXTuningLimits` with the settings sliders, and unset keys
+// fall back to `AppSettingsDefaults`, so stored and shown values always agree.
 extension UserDefaults {
     var mlxMaxOutputTokens: Int {
         get {
             guard object(forKey: AppSettingsKeys.mlxMaxOutputTokens) != nil else {
-                return 0
+                return AppSettingsDefaults.mlxMaxOutputTokens
             }
-            let storedValue = integer(forKey: AppSettingsKeys.mlxMaxOutputTokens)
-            if storedValue <= 0 {
-                return 0
-            }
-            return min(max(storedValue, 512), 1024)
+            return Self.clampedMaxOutputTokens(integer(forKey: AppSettingsKeys.mlxMaxOutputTokens))
         }
         set {
-            let clampedValue = newValue <= 0 ? 0 : min(max(newValue, 512), 1024)
-            set(clampedValue, forKey: AppSettingsKeys.mlxMaxOutputTokens)
+            set(Self.clampedMaxOutputTokens(newValue), forKey: AppSettingsKeys.mlxMaxOutputTokens)
         }
+    }
+
+    /// 0 or less means unlimited; anything else is kept inside the slider's range.
+    private static func clampedMaxOutputTokens(_ value: Int) -> Int {
+        guard value > 0 else { return 0 }
+        let range = MLXTuningLimits.outputTokenRange
+        return min(max(value, range.lowerBound), range.upperBound)
     }
 
     var mlxMaxOutputTokensLimit: Int? {
@@ -407,7 +455,7 @@ extension UserDefaults {
     }
 
     func mlxContextWindowTokens(deviceMaximum: Int) -> Int {
-        let minimum = 512
+        let minimum = MLXTuningLimits.minimumContextWindowTokens
 
         guard object(forKey: AppSettingsKeys.mlxContextWindowTokens) != nil else {
             return deviceMaximum
@@ -427,7 +475,7 @@ extension UserDefaults {
             if object(forKey: AppSettingsKeys.mlxEnableRotorQuant) != nil {
                 return bool(forKey: AppSettingsKeys.mlxEnableRotorQuant)
             }
-            return true
+            return AppSettingsDefaults.mlxEnableRotorQuant
         }
         set { set(newValue, forKey: AppSettingsKeys.mlxEnableRotorQuant) }
     }
@@ -435,15 +483,18 @@ extension UserDefaults {
     var mlxRepetitionPenalty: Double {
         get {
             guard object(forKey: AppSettingsKeys.mlxRepetitionPenalty) != nil else {
-                return 1.0
+                return AppSettingsDefaults.mlxRepetitionPenalty
             }
-            let storedValue = double(forKey: AppSettingsKeys.mlxRepetitionPenalty)
-            return min(max(storedValue, 1.0), 1.5)
+            return Self.clampedRepetitionPenalty(double(forKey: AppSettingsKeys.mlxRepetitionPenalty))
         }
         set {
-            let clampedValue = min(max(newValue, 1.0), 1.5)
-            set(clampedValue, forKey: AppSettingsKeys.mlxRepetitionPenalty)
+            set(Self.clampedRepetitionPenalty(newValue), forKey: AppSettingsKeys.mlxRepetitionPenalty)
         }
+    }
+
+    /// From no penalty up to the slider's maximum.
+    private static func clampedRepetitionPenalty(_ value: Double) -> Double {
+        min(max(value, MLXTuningLimits.noRepetitionPenalty), MLXTuningLimits.repetitionPenaltyRange.upperBound)
     }
 
     var mlxRepetitionPenaltyValue: Float? {

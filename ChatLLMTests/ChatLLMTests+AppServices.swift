@@ -21,20 +21,20 @@ extension ChatLLMTests {
         #expect(!ChatView.shouldPresentInAppBrowser(for: try #require(URL(string: "tel:+123456"))))
     }
 
-    @Test func networkMonitorStartsOfflineUntilFirstPathResolves() async {
+    @Test func networkMonitorAssumesConnectedUntilFirstPathResolves() async throws {
         let monitor = FakePathMonitor()
         let networkMonitor = NetworkMonitor(
             monitor: monitor,
             queue: DispatchQueue(label: "test.network.monitor")
         )
 
-        #expect(!networkMonitor.isConnected)
+        #expect(networkMonitor.isConnected)
+
+        monitor.emit(.unsatisfied)
+        try await waitUntil { !networkMonitor.isConnected }
 
         monitor.emit(.satisfied)
-        await Task.yield()
-        try? await Task.sleep(for: .milliseconds(20))
-
-        #expect(networkMonitor.isConnected)
+        try await waitUntil { networkMonitor.isConnected }
     }
 
     @Test func composerReturnKeyBehaviorSendsOnlyWhenEnabledAndSendable() {
@@ -69,7 +69,6 @@ extension ChatLLMTests {
         let composer = ComposerTextView(
             text: .constant(""),
             isFocused: probe.binding,
-            measuredHeight: .constant(24),
             sendOnReturn: false,
             canSend: false,
             isGenerating: false,
@@ -112,7 +111,6 @@ extension ChatLLMTests {
             ComposerTextView(
                 text: .constant("Hello"),
                 isFocused: .constant(true),
-                measuredHeight: .constant(24),
                 sendOnReturn: false,
                 canSend: canSend,
                 isGenerating: isGenerating,
@@ -130,10 +128,7 @@ extension ChatLLMTests {
     }
 
     @Test func disabledHapticsSuppressFeedbackDispatch() throws {
-        let suiteName = "haptics-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defaults.removePersistentDomain(forName: suiteName)
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = try makeScratchDefaults(#function)
 
         defaults.enableHapticsPreference = false
         var invoked = false

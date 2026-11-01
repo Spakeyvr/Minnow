@@ -89,7 +89,7 @@ extension ChatLLMTests {
         viewModel.conversation.messages.append(nextUser)
 
         let request = viewModel.buildFoundationRequest(upToOrderExclusive: 3)
-        let qwenMessages = try await viewModel.buildQwenMessages(upToOrderExclusive: 3)
+        let qwenMessages = try await viewModel.buildMLXPrompt(upToOrderExclusive: 3).messages
 
         #expect(request.history.contains { $0.content == "Try the hard request" })
         #expect(request.prompt == "Try again with less detail")
@@ -230,7 +230,7 @@ extension ChatLLMTests {
         #expect(assistant.text == "A plain answer.")
     }
 
-    @Test func buildQwenMessagesExcludeHistoricalReasoningFromContext() async throws {
+    @Test func buildMLXPromptExcludeHistoricalReasoningFromContext() async throws {
         let viewModel = try makeViewModel()
         viewModel.conversation.reasoningMode = true
 
@@ -263,7 +263,7 @@ extension ChatLLMTests {
         viewModel.conversation.messages.append(assistant)
         viewModel.conversation.messages.append(nextUser)
 
-        let messages = try await viewModel.buildQwenMessages(upToOrderExclusive: 3)
+        let messages = try await viewModel.buildMLXPrompt(upToOrderExclusive: 3).messages
         let assistantMessage = try #require(messages.first(where: { $0.role == .assistant }))
 
         #expect(assistantMessage.content == "Swift 6.2 is now available.")
@@ -271,7 +271,7 @@ extension ChatLLMTests {
         #expect(!assistantMessage.content.contains("<think>"))
     }
 
-    @Test func buildQwenMessagesIncludePersistedSystemPrompt() async throws {
+    @Test func buildMLXPromptIncludePersistedSystemPrompt() async throws {
         let viewModel = try makeViewModel()
 
         let system = ChatLLM.Message(
@@ -292,13 +292,13 @@ extension ChatLLMTests {
         viewModel.conversation.messages.append(system)
         viewModel.conversation.messages.append(user)
 
-        let messages = try await viewModel.buildQwenMessages(upToOrderExclusive: 2)
+        let messages = try await viewModel.buildMLXPrompt(upToOrderExclusive: 2).messages
         let systemMessage = try #require(messages.first(where: { $0.role == .system }))
 
         #expect(systemMessage.content.contains("Respond in terse bullet points."))
     }
 
-    @Test func buildQwenMessagesApplyChatPreferencesAtUserPriority() async throws {
+    @Test func buildMLXPromptApplyChatPreferencesAtUserPriority() async throws {
         let viewModel = try makeViewModel()
         viewModel.conversation.chatPreferences = "Use plain language."
 
@@ -311,7 +311,7 @@ extension ChatLLMTests {
         )
         viewModel.conversation.messages.append(user)
 
-        let messages = try await viewModel.buildQwenMessages(upToOrderExclusive: 1)
+        let messages = try await viewModel.buildMLXPrompt(upToOrderExclusive: 1).messages
         let systemMessage = try #require(messages.first(where: { $0.role == .system }))
         let userMessage = try #require(messages.first(where: { $0.role == .user }))
 
@@ -321,7 +321,7 @@ extension ChatLLMTests {
         #expect(userMessage.content.contains("User request:\nExplain Swift actors"))
     }
 
-    @Test func buildQwenMessagesUsesModelIdentityWithoutQuantizationInSystemPrompt() async throws {
+    @Test func buildMLXPromptUsesModelIdentityWithoutQuantizationInSystemPrompt() async throws {
         let viewModel = try makeViewModel()
 
         let user = ChatLLM.Message(
@@ -333,10 +333,10 @@ extension ChatLLMTests {
         )
         viewModel.conversation.messages.append(user)
 
-        let messages = try await viewModel.buildQwenMessages(
+        let messages = try await viewModel.buildMLXPrompt(
             upToOrderExclusive: 1,
             modelIdentity: "Qwen 3.5 4B"
-        )
+        ).messages
         let systemMessage = try #require(messages.first(where: { $0.role == .system }))
 
         #expect(systemMessage.content.contains("You are Qwen 3.5 4B, a helpful and friendly assistant. Be conversational and practical."))
@@ -344,7 +344,7 @@ extension ChatLLMTests {
         #expect(!systemMessage.content.contains("mixed"))
     }
 
-    @Test func buildQwenPromptStablePrefixExcludesDateLine() async throws {
+    @Test func buildMLXPromptStablePrefixExcludesDateLine() async throws {
         let viewModel = try makeViewModel()
         viewModel.conversation.messages.append(ChatLLM.Message(
             role: .user,
@@ -354,20 +354,21 @@ extension ChatLLMTests {
             isFinal: true
         ))
 
-        let dated = try await viewModel.buildQwenPrompt(upToOrderExclusive: 1, toolsAvailable: true)
+        let dated = try await viewModel.buildMLXPrompt(upToOrderExclusive: 1, toolsAvailable: true)
         let datedSystem = try #require(dated.messages.first(where: { $0.role == .system })).content
-        #expect(datedSystem.contains("Current date and time:"))
-        #expect(datedSystem.hasPrefix(dated.stableSystemPrompt))
-        #expect(!dated.stableSystemPrompt.contains("Current date and time:"))
+        let datedUser = try #require(dated.messages.last(where: { $0.role == .user })).content
+        #expect(!datedSystem.contains("Current date and time:"))
+        #expect(datedUser.contains("Current date and time:"))
+        #expect(dated.stableSystemPrompt == datedSystem)
 
         viewModel.conversation.messages[0].text = "Explain value types in Swift."
-        let plain = try await viewModel.buildQwenPrompt(upToOrderExclusive: 1, toolsAvailable: true)
+        let plain = try await viewModel.buildMLXPrompt(upToOrderExclusive: 1, toolsAvailable: true)
         let plainSystem = try #require(plain.messages.first(where: { $0.role == .system })).content
         #expect(!plainSystem.contains("Current date and time:"))
         #expect(plain.stableSystemPrompt == plainSystem)
     }
 
-    @Test func buildQwenMessagesKeepsOrdinaryMLXPromptStable() async throws {
+    @Test func buildMLXPromptKeepsOrdinaryMLXPromptStable() async throws {
         let viewModel = try makeViewModel()
         let user = ChatLLM.Message(
             role: .user,
@@ -378,17 +379,17 @@ extension ChatLLMTests {
         )
         viewModel.conversation.messages.append(user)
 
-        let messages = try await viewModel.buildQwenMessages(
+        let messages = try await viewModel.buildMLXPrompt(
             upToOrderExclusive: 1,
             toolsAvailable: true,
             forceWebSearch: false
-        )
+        ).messages
         let systemMessage = try #require(messages.first(where: { $0.role == .system }))
 
         #expect(!systemMessage.content.contains("Current date and time:"))
     }
 
-    @Test func buildQwenMessagesAddsTimeContextForTimeSensitiveMLXTurn() async throws {
+    @Test func buildMLXPromptAddsTimeContextForTimeSensitiveMLXTurn() async throws {
         let viewModel = try makeViewModel()
         let user = ChatLLM.Message(
             role: .user,
@@ -399,13 +400,16 @@ extension ChatLLMTests {
         )
         viewModel.conversation.messages.append(user)
 
-        let messages = try await viewModel.buildQwenMessages(
+        let messages = try await viewModel.buildMLXPrompt(
             upToOrderExclusive: 1,
             toolsAvailable: true,
             forceWebSearch: false
-        )
+        ).messages
         let systemMessage = try #require(messages.first(where: { $0.role == .system }))
+        let userMessage = try #require(messages.last(where: { $0.role == .user }))
 
-        #expect(systemMessage.content.contains("Current date and time:"))
+        #expect(!systemMessage.content.contains("Current date and time:"))
+        #expect(userMessage.content.contains("Current date and time:"))
+        #expect(userMessage.content.hasSuffix("User request:\nWhat is the latest Swift release today?"))
     }
 }

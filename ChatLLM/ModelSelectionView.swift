@@ -35,7 +35,7 @@ struct ModelSelectionView: View {
                 }
                 .alert("Model Error", isPresented: errorBinding) {
                     Button("OK") {
-                        modelManager?.loadError = nil
+                        modelManager?.clearLoadError()
                     }
                 } message: {
                     if let error = modelManager?.loadError {
@@ -79,18 +79,23 @@ struct ModelSelectionView: View {
     private var errorBinding: Binding<Bool> {
         Binding(
             get: { modelManager?.loadError != nil },
-            set: { _ in }
+            // However the alert closes, the error is handled; otherwise it shows again.
+            set: { isPresented in
+                if !isPresented {
+                    modelManager?.clearLoadError()
+                }
+            }
         )
     }
 
     private func deleteModel(_ model: MLXModelManager.MLXModelInfo) {
         guard let modelManager else { return }
-        Task {
-            do {
-                try modelBackendBridge.deleteModel(model)
-            } catch {
-                modelManager.loadError = String(localized: "Delete failed: \(error.localizedDescription)", bundle: .appLocalized)
-            }
+        do {
+            try modelBackendBridge.deleteModel(model)
+        } catch {
+            modelManager.reportLoadError(
+                String(localized: "Delete failed: \(error.localizedDescription)", bundle: .appLocalized)
+            )
         }
     }
 }
@@ -345,9 +350,16 @@ struct InfoRow: View {
     }
 }
 
-// MARK: - Loading Overlay
-
 // MARK: - Previews
+
+private extension MLXModelManager.MLXModelInfo {
+    /// A catalog model for previews, marked downloaded or not.
+    static func preview(id: String, isAvailable: Bool) -> Self {
+        var model = MLXModelManager.modelDefinitions.first { $0.id == id } ?? MLXModelManager.modelDefinitions[0]
+        model.isAvailable = isAvailable
+        return model
+    }
+}
 
 #Preview {
     ModelSelectionView()
@@ -356,43 +368,18 @@ struct InfoRow: View {
 #Preview("Model Row - Available") {
     @Previewable @State var showingInfo = false
     let mgr = MLXModelManager()
+    let model = MLXModelManager.MLXModelInfo.preview(id: "qwen3.5-4b-4bit-hybrid", isAvailable: true)
 
     List {
         ModelRow(
-            model: MLXModelManager.MLXModelInfo(
-                id: "qwen3.5-4b-4bit-hybrid",
-                name: "Qwen 3.5",
-                localDirName: "Qwen3.5-4B-MLX-4bit-hybrid",
-                hfRepoId: "Spakie/Qwen3.5-4B-MLX-4bit-hybrid",
-                parameters: "4B (4-bit hybrid)",
-                downloadSizeLabel: "2.66 GB",
-                loadPolicy: .qwenMultimodal,
-                description: "Qwen 3.5 4B multimodal model with native reasoning and vision.",
-                contextLength: 262144,
-                isAvailable: true,
-                supportsReasoning: true
-            ),
+            model: model,
             modelManager: mgr,
             onInfo: { showingInfo = true },
             onDelete: {}
         )
     }
     .sheet(isPresented: $showingInfo) {
-        ModelInfoSheet(
-            model: MLXModelManager.MLXModelInfo(
-                id: "qwen3.5-4b-4bit-hybrid",
-                name: "Qwen 3.5",
-                localDirName: "Qwen3.5-4B-MLX-4bit-hybrid",
-                hfRepoId: "Spakie/Qwen3.5-4B-MLX-4bit-hybrid",
-                parameters: "4B (4-bit hybrid)",
-                downloadSizeLabel: "2.66 GB",
-                loadPolicy: .qwenMultimodal,
-                description: "Qwen 3.5 4B multimodal model with native reasoning and vision.",
-                contextLength: 262144,
-                isAvailable: true,
-                supportsReasoning: true
-            )
-        )
+        ModelInfoSheet(model: model)
     }
 }
 
@@ -401,19 +388,7 @@ struct InfoRow: View {
 
     List {
         ModelRow(
-            model: MLXModelManager.MLXModelInfo(
-                id: "qwen3.5-2b-4bit",
-                name: "Qwen 3.5",
-                localDirName: "Qwen3.5-2B-MLX-4bit",
-                hfRepoId: "mlx-community/Qwen3.5-2B-4bit",
-                parameters: "2B (4-bit)",
-                downloadSizeLabel: "1.75 GB",
-                loadPolicy: .qwenMultimodal,
-                description: "Qwen 3.5 2B multimodal model with native reasoning and vision.",
-                contextLength: 262144,
-                isAvailable: false,
-                supportsReasoning: true
-            ),
+            model: .preview(id: "qwen3.5-2b-4bit", isAvailable: false),
             modelManager: mgr,
             onInfo: {},
             onDelete: {}

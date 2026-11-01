@@ -5,6 +5,7 @@
 //  Split out of MLXModelManager.swift as part of the Type+Concern organization.
 //
 
+import CryptoKit
 import Foundation
 import MLX
 import MLXLMCommon
@@ -13,7 +14,6 @@ import OSLog
 extension MLXModelManager {
     // MARK: - Generation
 
-    nonisolated private static let maximumPromptTokenCountCacheEntries = 256
     /// 4-bit keys and values. With 3-bit keys or 2- or 3-bit values, LFM2.5
     /// looped instead of answering after a 10K-token prompt; 4/4 matched the
     /// uncompressed answer and still keeps the KV about 3.5x smaller.
@@ -28,45 +28,78 @@ extension MLXModelManager {
     /// little prompt fidelity for a bounded dense KV peak. Shorter prompts stay exact.
     nonisolated private static let rotorQuantPrefillExactLimit = 4096
     nonisolated private static let memoryConstrainedMaxKVSize = 4096
-    nonisolated internal static func promptTokenCountFingerprint(
-        role: Chat.Message.Role,
-        content: String
-    ) -> Int {
-        var hasher = Hasher()
-        hasher.combine(role.rawValue)
-        hasher.combine(content)
-        return hasher.finalize()
-    }
+    /// Output cap for tool turns, which loop through several generations.
+    nonisolated static let toolTurnMaxOutputTokens = 4096
+    /// Safety cap when the user picked "Unlimited Output". Long enough for
+    /// any real answer with reasoning, but it stops a model stuck in a loop
+    /// before its KV cache grows until the app is terminated.
+    nonisolated static let unlimitedOutputSafetyCapTokens = 8192
+    /// Output cap after a memory warning.
+    nonisolated static let memoryConstrainedMaxOutputTokens = 1024
 
     func tokenCountForLoadedModelText(
         role: Chat.Message.Role,
         content: String
     ) async -> Int? {
         guard let currentModel, let container else { return nil }
-        let cacheKey = PromptTokenCountCacheKey(
-            modelID: currentModel.id,
-            fingerprint: Self.promptTokenCountFingerprint(role: role, content: content)
-        )
-        if let cachedCount = promptTokenCountCache[cacheKey] {
-            if let existingIndex = promptTokenCountCacheOrder.firstIndex(of: cacheKey) {
-                promptTokenCountCacheOrder.remove(at: existingIndex)
-            }
-            promptTokenCountCacheOrder.append(cacheKey)
+        let cacheKey = PromptTokenCountCacheKey(modelID: currentModel.id, role: role, content: content)
+        if let cachedCount = promptTokenCountCache.value(for: cacheKey) {
             return cachedCount
         }
         let tokenCount = await container.encode(content).count
-        promptTokenCountCache[cacheKey] = tokenCount
-        promptTokenCountCacheOrder.append(cacheKey)
-        if promptTokenCountCacheOrder.count > Self.maximumPromptTokenCountCacheEntries {
-            let evictedKey = promptTokenCountCacheOrder.removeFirst()
-            promptTokenCountCache.removeValue(forKey: evictedKey)
-        }
+        promptTokenCountCache.insert(tokenCount, for: cacheKey)
         return tokenCount
     }
 
-    struct PromptTokenCountCacheKey: Hashable {
+    /// Identifies message content by model, role and SHA-256 digest, so two
+    /// different messages never share a count and the cache does not keep a
+    /// second copy of the conversation text.
+    nonisolated struct PromptTokenCountCacheKey: Hashable, Sendable {
         let modelID: String
-        let fingerprint: Int
+        let digest: SHA256Digest
+
+        init(modelID: String, role: Chat.Message.Role, content: String) {
+            self.modelID = modelID
+            var hasher = SHA256()
+            hasher.update(data: Data(role.rawValue.utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(content.utf8))
+            self.digest = hasher.finalize()
+        }
+    }
+
+    /// Least-recently-used token counts. Lookups and inserts are O(1);
+    /// eviction drops the oldest quarter at once, so its sort is amortized
+    /// over many inserts instead of shifting an array on every hit.
+    nonisolated struct PromptTokenCountCache: Sendable {
+        static let maximumEntries = 256
+
+        private var entries: [PromptTokenCountCacheKey: (count: Int, lastUse: UInt64)] = [:]
+        private var clock: UInt64 = 0
+
+        var count: Int { entries.count }
+
+        mutating func value(for key: PromptTokenCountCacheKey) -> Int? {
+            guard let entry = entries[key] else { return nil }
+            clock &+= 1
+            entries[key] = (entry.count, clock)
+            return entry.count
+        }
+
+        mutating func insert(_ count: Int, for key: PromptTokenCountCacheKey) {
+            clock &+= 1
+            entries[key] = (count, clock)
+            guard entries.count > Self.maximumEntries else { return }
+            let evictionCount = entries.count - Self.maximumEntries * 3 / 4
+            let oldest = entries.sorted { $0.value.lastUse < $1.value.lastUse }.prefix(evictionCount)
+            for (key, _) in oldest {
+                entries.removeValue(forKey: key)
+            }
+        }
+
+        mutating func removeAll() {
+            entries.removeAll(keepingCapacity: false)
+        }
     }
 
     struct MLXGenerationResult: Sendable {
@@ -120,8 +153,14 @@ extension MLXModelManager {
         )
     }
 
-    var shouldPreferRotorQuant: Bool {
+    var isRotorQuantEnabled: Bool {
         defaults.mlxEnableRotorQuant
+    }
+
+    /// Generation degrades to a bounded cache and a short output cap after
+    /// iOS has warned about memory since the current model loaded.
+    var isMemoryConstrainedForGeneration: Bool {
+        hasSeenMemoryWarningSinceCurrentLoad
     }
 
     func generateTextStream(
@@ -143,15 +182,15 @@ extension MLXModelManager {
         guard self.container === container, self.currentModel?.id == currentModel.id else {
             throw GenerationError.modelNotLoaded
         }
+        let memoryConstrained = memoryConstrained || isMemoryConstrainedForGeneration
         let includesMedia = messages.contains { !$0.images.isEmpty || !$0.videos.isEmpty }
         let configuredMaxOutputTokens = defaults.mlxMaxOutputTokensLimit
         let configuredContextWindow = configuredContextWindowLimit(for: currentModel)
-        let rotorQuantRequested = defaults.mlxEnableRotorQuant
         let generationConfiguration = Self.generationConfiguration(
-            isEnabled: rotorQuantRequested,
-            preferRotorQuant: shouldPreferRotorQuant,
+            rotorQuantEnabled: isRotorQuantEnabled,
             hasTools: !tools.isEmpty,
             hasMedia: includesMedia,
+            enableThinking: enableThinking,
             memoryConstrained: memoryConstrained,
             prefersBoundedCache: prefersBoundedKVCacheAcrossTurns,
             configuredMaxOutputTokens: configuredMaxOutputTokens,
@@ -166,20 +205,19 @@ extension MLXModelManager {
         )
         MLXMemoryDiagnostics.log(logger, "generation.start")
         let toolCallFormat = await container.configuration.toolCallFormat
-        let suppressWrappedXMLToolMarkup =
-            !tools.isEmpty &&
-            toolCallFormat == .xmlFunction &&
-            usesWrappedXMLToolCalls(for: currentModel)
+        let suppressWrappedXMLToolMarkup: Bool
+        if !tools.isEmpty, toolCallFormat == .xmlFunction {
+            suppressWrappedXMLToolMarkup = await usesWrappedXMLToolCalls(for: currentModel)
+        } else {
+            suppressWrappedXMLToolMarkup = false
+        }
         if suppressWrappedXMLToolMarkup {
             logger.notice("MLX wrapped XML tool-call filter enabled: model=\(currentModel.localDirName, privacy: .public)")
         }
-        prepareMemoryForGeneration()
 
-        let tunedPrefillStepSize = await inferenceWorker.prefillStepSize(for: currentModel.id)
-        let prefillStepSize = Self.adaptivePrefillStepSize(
-            tuned: tunedPrefillStepSize,
-            messages: messages
-        )
+        // A prompt shorter than the tuned step is one chunk either way, so
+        // the tuned step is used as is.
+        let prefillStepSize = await inferenceWorker.prefillStepSize(for: currentModel.id)
         let params = Self.makeGenerateParameters(
             maxTokens: generationConfiguration.maxTokens,
             maxKVSize: generationConfiguration.maxKVSize,
@@ -194,7 +232,7 @@ extension MLXModelManager {
         let processing = UserInput.Processing()
 
         if !tools.isEmpty {
-            try validateToolTemplateSupport(for: currentModel)
+            try await validateToolTemplateSupport(for: currentModel)
         }
 
         let sessionKey = MLXSessionKey(
@@ -215,9 +253,11 @@ extension MLXModelManager {
             tools: tools,
             params: params,
             suppressWrappedXMLToolMarkup: suppressWrappedXMLToolMarkup,
-            stableSystemPrompt: stableSystemPrompt
+            stableSystemPrompt: stableSystemPrompt,
+            sessionTokenLimit: configuredContextWindow
         )
 
+        prepareMemoryForGeneration()
         do {
             let response = try await inferenceWorker.generate(
                 request: request,
@@ -226,13 +266,20 @@ extension MLXModelManager {
                 onToolCall: onToolCall
             )
             cleanupMemoryAfterGeneration()
-            if !memoryConstrained {
+            // A stopped response returns normally; tuning right after it
+            // would compete with the message the user is about to send.
+            if !memoryConstrained, !Task.isCancelled {
                 await startDeferredTuningIfNeeded(container: container, model: currentModel)
             }
             return MLXGenerationResult(
                 toolInvocationCount: response.toolInvocationCount,
                 metrics: response.metrics
             )
+        } catch is CancellationError {
+            // A user Stop or a superseded turn; not a failure.
+            logger.notice("MLX generation cancelled")
+            cleanupMemoryAfterGenerationError()
+            throw CancellationError()
         } catch {
             logger.error("MLX generation failed: \(error.localizedDescription, privacy: .public)")
             cleanupMemoryAfterGenerationError()
@@ -261,26 +308,33 @@ extension MLXModelManager {
             }
         }
     }
+    /// - Parameter configuredMaxOutputTokens: the user's output limit, or nil
+    ///   for "Unlimited Output". Every turn is still capped: tool turns at
+    ///   `toolTurnMaxOutputTokens` (each tool-loop step is one generation),
+    ///   other memory-constrained turns at `memoryConstrainedMaxOutputTokens`, and
+    ///   all others at `unlimitedOutputSafetyCapTokens`.
+    /// - Parameter enableThinking: thinking turns skip the memory-constrained
+    ///   cap, which reasoning alone can use up and leave no answer; the bounded
+    ///   KV cache already holds their memory down.
     nonisolated internal static func generationConfiguration(
-        isEnabled: Bool,
-        preferRotorQuant: Bool,
+        rotorQuantEnabled: Bool,
         hasTools: Bool,
         hasMedia: Bool,
+        enableThinking: Bool = false,
         memoryConstrained: Bool,
         prefersBoundedCache: Bool,
         configuredMaxOutputTokens: Int?,
         configuredContextWindow: Int,
         contextWindowLimitRaised: Bool = false
     ) -> GenerationConfiguration {
-        let maxTokens: Int? = if hasTools {
-            configuredMaxOutputTokens.map { min($0, 4096) } ?? 4096
-        } else if memoryConstrained {
-            configuredMaxOutputTokens.map { min($0, 1024) }
-        } else {
-            configuredMaxOutputTokens
+        var maxTokens = configuredMaxOutputTokens ?? unlimitedOutputSafetyCapTokens
+        if hasTools {
+            maxTokens = min(maxTokens, toolTurnMaxOutputTokens)
+        } else if memoryConstrained && !enableThinking {
+            maxTokens = min(maxTokens, memoryConstrainedMaxOutputTokens)
         }
         let cachePolicy = cachePolicy(
-            isEnabled: isEnabled && preferRotorQuant,
+            isEnabled: rotorQuantEnabled,
             hasTools: hasTools,
             prefersBoundedCache: prefersBoundedCache,
             memoryConstrained: memoryConstrained
@@ -295,7 +349,6 @@ extension MLXModelManager {
             cachePolicy: clampedCachePolicy,
             cacheCompression: cacheCompressionMode(
                 cachePolicy: clampedCachePolicy,
-                preferRotorQuant: preferRotorQuant,
                 hasMedia: hasMedia
             )
         )
@@ -345,33 +398,30 @@ extension MLXModelManager {
         }
     }
 
+    /// The cache policy already reflects whether RotorQuant is enabled; it is
+    /// `.persistentRotorQuant` only then.
     nonisolated internal static func cacheCompressionMode(
         cachePolicy: MLXCachePolicy,
-        preferRotorQuant: Bool,
         hasMedia: Bool = false
     ) -> CacheCompressionMode {
         guard cachePolicy.usesRotorQuantCompression else {
             return .none
         }
 
-        if preferRotorQuant {
-            let exactBufferSize = hasMedia ? rotorQuantMediaExactBufferSize : rotorQuantExactBufferSize
-            let attentionBlockTokens =
-                hasMedia ? rotorQuantMediaAttentionBlockTokens : rotorQuantAttentionBlockTokens
-            return .rotorQuant(
-                RotorQuantConfiguration(
-                    keyBits: rotorQuantKeyBits,
-                    valueBits: rotorQuantValueBits,
-                    seed: rotorQuantSeed,
-                    exactBufferSize: exactBufferSize,
-                    attentionBlockTokens: attentionBlockTokens,
-                    variant: .iso,
-                    prefillExactLimit: rotorQuantPrefillExactLimit
-                )
+        let exactBufferSize = hasMedia ? rotorQuantMediaExactBufferSize : rotorQuantExactBufferSize
+        let attentionBlockTokens =
+            hasMedia ? rotorQuantMediaAttentionBlockTokens : rotorQuantAttentionBlockTokens
+        return .rotorQuant(
+            RotorQuantConfiguration(
+                keyBits: rotorQuantKeyBits,
+                valueBits: rotorQuantValueBits,
+                seed: rotorQuantSeed,
+                exactBufferSize: exactBufferSize,
+                attentionBlockTokens: attentionBlockTokens,
+                variant: .iso,
+                prefillExactLimit: rotorQuantPrefillExactLimit
             )
-        }
-
-        return .none
+        )
     }
 
     nonisolated internal static func makeGenerateParameters(
@@ -384,10 +434,11 @@ extension MLXModelManager {
         prefillStepSize: Int,
         repetitionPenalty: Float?
     ) -> GenerateParameters {
-        let isQwen35Model = currentModelID.hasPrefix("qwen3.5-")
+        let family = MLXModelInfo.Family(modelID: currentModelID)
+        let isQwen35Model = family == .qwen35
 
         // LiquidAI's generation_config.json: temperature 0.1, top-k 50, repetition 1.1.
-        if currentModelID == "lfm2.5-2.6b-4bit" {
+        if family == .lfm25 {
             return GenerateParameters(
                 maxTokens: maxTokens,
                 maxKVSize: maxKVSize,

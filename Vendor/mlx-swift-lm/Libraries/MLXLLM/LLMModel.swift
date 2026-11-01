@@ -28,6 +28,9 @@ extension LLMModel {
 
         // Prepare the prompt in chunks if larger than the prefill size
         while y.tokens.size > prefillStepSize {
+            // ChatLLM: a long prompt runs many chunks; stop between them so a
+            // cancelled generation releases the GPU and the model container.
+            try Task.checkCancellation()
             autoreleasepool {
                 let input = y[.newAxis, ..<prefillStepSize]
                 _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)

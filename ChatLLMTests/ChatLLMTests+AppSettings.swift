@@ -16,23 +16,9 @@ import FoundationModels
 @testable import ChatLLM
 
 extension ChatLLMTests {
-    @Test func settingsSheetDescribesAdaptiveKVCacheBehavior() {
-        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("Enabled by default"))
-        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("IsoQuant"))
-        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("4-bit keys"))
-        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("4-bit values"))
-        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("text and image"))
-        #expect(SettingsSheet.mlxRotorQuantInfoMessage.contains("Tool and low-memory"))
-        #expect(SettingsSheet.mlxRotorQuantAccessibilityHint.contains("safer cache modes"))
-        #expect(SettingsSheet.mlxRotorQuantExperimentalTitle.contains("Experimental"))
-        #expect(SettingsSheet.mlxRotorQuantExperimentalMessage.contains("very early"))
-        #expect(SettingsSheet.mlxRotorQuantExperimentalMessage.contains("beta"))
-    }
-
     @Test func generationConfigurationUsesStructuredRotorQuantWhenPreferred() {
         let configuration = MLXModelManager.generationConfiguration(
-            isEnabled: true,
-            preferRotorQuant: true,
+            rotorQuantEnabled: true,
             hasTools: false,
             hasMedia: false,
             memoryConstrained: false,
@@ -56,8 +42,7 @@ extension ChatLLMTests {
 
     @Test func generationConfigurationUsesMediaTunedRotorQuantProfile() {
         let configuration = MLXModelManager.generationConfiguration(
-            isEnabled: true,
-            preferRotorQuant: true,
+            rotorQuantEnabled: true,
             hasTools: false,
             hasMedia: true,
             memoryConstrained: false,
@@ -81,27 +66,15 @@ extension ChatLLMTests {
     }
 
     @Test func userDefaultsRotorQuantDefaultsToEnabledWhenUnset() {
-        let key = AppSettingsKeys.mlxEnableRotorQuant
+        // The environment's defaults are a fresh domain, so the key starts unset.
         let defaults = testEnvironment.defaults
-        let hadExistingValue = defaults.object(forKey: key) != nil
-        let previousValue = defaults.bool(forKey: key)
-
-        defaults.removeObject(forKey: key)
-        defer {
-            if hadExistingValue {
-                defaults.set(previousValue, forKey: key)
-            } else {
-                defaults.removeObject(forKey: key)
-            }
-        }
+        #expect(defaults.object(forKey: AppSettingsKeys.mlxEnableRotorQuant) == nil)
 
         #expect(defaults.mlxEnableRotorQuant)
     }
 
     @Test func unlimitedOutputDefaultsApplyOnFirstLoadAndReset() throws {
-        let suiteName = "settings-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = try makeScratchDefaults(#function)
 
         #expect(defaults.mlxMaxOutputTokensLimit == nil)
         var draft = AppSettingsDraft.load(from: defaults)
@@ -113,9 +86,7 @@ extension ChatLLMTests {
     }
 
     @Test func unlimitedOutputDefaultPreservesSavedLimits() throws {
-        let suiteName = "settings-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = try makeScratchDefaults(#function)
 
         defaults.mlxMaxOutputTokens = 768
         #expect(defaults.mlxMaxOutputTokensLimit == 768)
@@ -126,42 +97,8 @@ extension ChatLLMTests {
         #expect(AppSettingsDraft.load(from: defaults).mlxMaxOutputTokens == 0)
     }
 
-    @Test func resetSettingsRestoresRotorQuantDefault() {
-        var draft = AppSettingsDraft.defaults()
-        draft.mlxEnableRotorQuant = false
-
-        draft.resetToDefaults()
-
-        #expect(draft.mlxEnableRotorQuant)
-    }
-
-    @Test func resetSettingsRestoresDeveloperModeDefault() {
-        var draft = AppSettingsDraft.defaults()
-        draft.developerModeEnabled = true
-
-        draft.resetToDefaults()
-
-        #expect(!draft.developerModeEnabled)
-    }
-
-    @Test func resetSettingsRestoresContextWindowAndToolCallDefaults() {
-        var draft = AppSettingsDraft.defaults()
-        draft.mlxContextWindowTokens = 4_096
-        draft.disableToolCalls = true
-        draft.sendOnReturn = true
-
-        draft.resetToDefaults()
-
-        #expect(draft.mlxContextWindowTokens == 0)
-        #expect(!draft.disableToolCalls)
-        #expect(!draft.sendOnReturn)
-    }
-
     @Test func appSettingsDraftDoesNotPersistUntilExplicitCommit() throws {
-        let suiteName = "settings-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defaults.removePersistentDomain(forName: suiteName)
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = try makeScratchDefaults(#function)
 
         defaults.set("Existing preferences", forKey: AppSettingsKeys.chatPreferences)
         defaults.set(false, forKey: AppSettingsKeys.developerModeEnabled)
@@ -184,10 +121,7 @@ extension ChatLLMTests {
     }
 
     @Test func appSettingsDraftMigratesLegacyDefaultPromptToChatPreferences() throws {
-        let suiteName = "settings-migration-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defaults.removePersistentDomain(forName: suiteName)
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = try makeScratchDefaults(#function)
 
         defaults.set("Prefer concise answers.", forKey: AppSettingsKeys.legacyDefaultSystemPrompt)
 
@@ -201,9 +135,7 @@ extension ChatLLMTests {
     }
 
     @Test func incrementalSettingsSaveOnlyWritesChangedPreferences() throws {
-        let suiteName = "settings-incremental-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = try makeScratchDefaults(#function)
 
         let previous = AppSettingsDraft.defaults()
         var updated = previous
@@ -222,9 +154,7 @@ extension ChatLLMTests {
     }
 
     @Test func incrementalSettingsSaveMigratesLegacyPreferencesWithoutChangingThem() throws {
-        let suiteName = "settings-incremental-migration-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = try makeScratchDefaults(#function)
         var previous = AppSettingsDraft.defaults()
         previous.chatPreferences = "Keep answers concise."
         defaults.set(previous.chatPreferences, forKey: AppSettingsKeys.legacyDefaultSystemPrompt)
@@ -289,7 +219,7 @@ extension ChatLLMTests {
         let loaded = AppSettingsDraft.load(from: defaults)
 
         #expect(loaded.appAppearance == "system")
-        #expect(loaded.appLanguage == "en")
+        #expect(loaded.appLanguage == AppLanguage.systemDefault.rawValue)
         #expect(loaded.messageFontSize == 16.0)
         #expect(loaded.autoDeleteDays == 30)
         // Haptics default on even though `bool(forKey:)` would say false.

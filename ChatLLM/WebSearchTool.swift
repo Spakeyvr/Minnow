@@ -8,6 +8,7 @@
 import Foundation
 import FoundationModels
 import MLXLMCommon
+import Synchronization
 import Tokenizers
 import OSLog
 
@@ -96,16 +97,12 @@ extension WebSearchSource {
 
         while index < lines.count {
             let line = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
-            guard line.range(of: #"^\[\d+\]\s+"#, options: .regularExpression) != nil else {
+            guard let headingEnd = legacyHeadingPrefixEnd(in: line) else {
                 index += 1
                 continue
             }
 
-            let title = line.replacingOccurrences(
-                of: #"^\[\d+\]\s+"#,
-                with: "",
-                options: .regularExpression
-            )
+            let title = String(line[headingEnd...])
             index += 1
 
             guard index < lines.count else { break }
@@ -126,7 +123,7 @@ extension WebSearchSource {
             var snippetLines: [String] = []
             while index < lines.count {
                 let candidate = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
-                if candidate.range(of: #"^\[\d+\]\s+"#, options: .regularExpression) != nil {
+                if legacyHeadingPrefixEnd(in: candidate) != nil {
                     break
                 }
                 if !candidate.isEmpty {
@@ -146,6 +143,24 @@ extension WebSearchSource {
         }
 
         return sources
+    }
+
+    /// Matches the `[n] ` prefix of a legacy source heading without building a
+    /// regular expression per line. Returns where the title starts.
+    nonisolated static func legacyHeadingPrefixEnd(in line: String) -> String.Index? {
+        guard line.first == "[" else { return nil }
+        var index = line.index(after: line.startIndex)
+        let digitsStart = index
+        while index < line.endIndex, line[index].isASCII, line[index].isNumber {
+            index = line.index(after: index)
+        }
+        guard index > digitsStart, index < line.endIndex, line[index] == "]" else { return nil }
+        index = line.index(after: index)
+        let whitespaceStart = index
+        while index < line.endIndex, line[index].isWhitespace {
+            index = line.index(after: index)
+        }
+        return index > whitespaceStart ? index : nil
     }
 }
 
@@ -338,8 +353,8 @@ extension SearchInvocation {
 
 final class AppWebSearchToolBridge: @unchecked Sendable {
 
-    static let toolName = "webSearch"
-    static let toolDescription = "Search the web for current information. Use for breaking news, today's events, real-time data, current prices or versions, or when the user explicitly asks to search."
+    nonisolated static let toolName = "webSearch"
+    nonisolated static let toolDescription = "Search the web for current information. Use for breaking news, today's events, real-time data, current prices or versions, or when the user explicitly asks to search."
 
     nonisolated struct MLXArguments: Codable, Sendable {
         var query: String
@@ -349,24 +364,27 @@ final class AppWebSearchToolBridge: @unchecked Sendable {
     static let maxInvocations = 2
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ChatLLM", category: "WebSearchTool")
 
+    private struct State: Sendable {
+        var invocations: [SearchInvocation] = []
+        var searchLimitReached = false
+        var invocationObserver: (@Sendable () -> Void)?
+    }
+
     // Thread-safe storage for captured results (written in `call`, read on @MainActor).
-    private let lock = NSLock()
-    private var _invocations: [SearchInvocation] = []
-    private var _searchLimitReached = false
-    nonisolated(unsafe) private var _invocationObserver: (@Sendable () -> Void)?
+    private let state = Mutex(State())
 
     var allInvocations: [SearchInvocation] {
-        lock.withLock { _invocations }
+        state.withLock { $0.invocations }
     }
 
     var searchLimitReached: Bool {
-        lock.withLock { _searchLimitReached }
+        state.withLock { $0.searchLimitReached }
     }
 
     /// True while a search request is in flight. The model emits nothing
     /// during that time, so stream timeouts must allow for network latency.
     var hasSearchInProgress: Bool {
-        lock.withLock { _invocations.contains { $0.status == .searching } }
+        state.withLock { $0.invocations.contains { $0.status == .searching } }
     }
 
     init(searchService: any WebSearchProviding) {
@@ -374,8 +392,8 @@ final class AppWebSearchToolBridge: @unchecked Sendable {
     }
 
     nonisolated func setInvocationObserver(_ observer: (@Sendable () -> Void)?) {
-        lock.withLock {
-            _invocationObserver = observer
+        state.withLock {
+            $0.invocationObserver = observer
         }
     }
 
@@ -425,10 +443,15 @@ final class AppWebSearchToolBridge: @unchecked Sendable {
     }
 
     func executeSearch(query: String) async throws -> String {
-        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let reservation = lock.withLock { () -> (id: UUID, priorInvocations: Int)? in
-            guard _invocations.count < Self.maxInvocations else {
-                _searchLimitReached = true
+        // Validate before reserving, so a malformed call does not use up one
+        // of the response's searches or show up as a failed search.
+        guard let trimmedQuery = Self.normalizedSearchQuery(query) else {
+            logger.warning("Search skipped: empty query")
+            return Self.invalidArgumentsToolResponse()
+        }
+        let reservation = state.withLock { state -> (id: UUID, priorInvocations: Int)? in
+            guard state.invocations.count < Self.maxInvocations else {
+                state.searchLimitReached = true
                 return nil
             }
             let invocation = SearchInvocation(
@@ -436,13 +459,13 @@ final class AppWebSearchToolBridge: @unchecked Sendable {
                 results: "",
                 status: .searching
             )
-            let priorInvocations = _invocations.count
-            _invocations.append(invocation)
+            let priorInvocations = state.invocations.count
+            state.invocations.append(invocation)
             return (invocation.id, priorInvocations)
         }
 
         guard let reservation else {
-            let count = lock.withLock { _invocations.count }
+            let count = state.withLock { $0.invocations.count }
             logger.warning("Search skipped: invocation limit reached (\(count, privacy: .public))")
             return Self.searchLimitToolResponse(limit: Self.maxInvocations)
         }
@@ -459,12 +482,13 @@ final class AppWebSearchToolBridge: @unchecked Sendable {
                 "Search failed: query_chars=\(trimmedQuery.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
             )
             let toolResponse = Self.searchFailedToolResponse(for: error)
-            lock.withLock {
-                guard let index = _invocations.firstIndex(where: { $0.id == reservation.id }) else { return }
-                _invocations[index].results = toolResponse
-                _invocations[index].status = .failed
-                _invocations[index].completedAt = Date()
-                _invocations[index].errorDescription = error.localizedDescription
+            let errorDescription = error.localizedDescription
+            state.withLock { state in
+                guard let index = state.invocations.firstIndex(where: { $0.id == reservation.id }) else { return }
+                state.invocations[index].results = toolResponse
+                state.invocations[index].status = .failed
+                state.invocations[index].completedAt = Date()
+                state.invocations[index].errorDescription = errorDescription
             }
             notifyInvocationObserver()
             return toolResponse
@@ -472,12 +496,12 @@ final class AppWebSearchToolBridge: @unchecked Sendable {
         let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
         let modelFacingText = response.modelFacingText()
 
-        lock.withLock {
-            guard let index = _invocations.firstIndex(where: { $0.id == reservation.id }) else { return }
-            _invocations[index].results = modelFacingText
-            _invocations[index].response = response
-            _invocations[index].status = .completed
-            _invocations[index].completedAt = Date()
+        state.withLock { state in
+            guard let index = state.invocations.firstIndex(where: { $0.id == reservation.id }) else { return }
+            state.invocations[index].results = modelFacingText
+            state.invocations[index].response = response
+            state.invocations[index].status = .completed
+            state.invocations[index].completedAt = Date()
         }
         notifyInvocationObserver()
 
@@ -489,7 +513,7 @@ final class AppWebSearchToolBridge: @unchecked Sendable {
     }
 
     nonisolated private func notifyInvocationObserver() {
-        let observer = lock.withLock { _invocationObserver }
+        let observer = state.withLock { $0.invocationObserver }
         observer?()
     }
 
@@ -506,6 +530,22 @@ final class AppWebSearchToolBridge: @unchecked Sendable {
     }
 
     // MARK: - Helpers
+
+    /// Trims the query and shortens an over-long one at a word boundary so it
+    /// fits Tavily's limit. Returns nil when nothing is left to search for.
+    nonisolated static func normalizedSearchQuery(_ query: String) -> String? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let limit = TavilySearchService.maximumQueryLength
+        guard trimmed.count > limit else { return trimmed }
+
+        let prefix = trimmed.prefix(limit)
+        if let boundary = prefix.lastIndex(where: \.isWhitespace) {
+            let shortened = prefix[..<boundary].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !shortened.isEmpty { return shortened }
+        }
+        return String(prefix)
+    }
 
     nonisolated static func searchLimitToolResponse(limit: Int) -> String {
         "[webSearch internal error: limit reached after \(limit) searches for this response. Do not call webSearch again. Continue with the available information.]"

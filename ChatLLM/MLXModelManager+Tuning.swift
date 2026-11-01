@@ -8,6 +8,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import OSLog
 import UIKit
 
@@ -15,28 +16,10 @@ extension MLXModelManager {
     // MARK: - Prefill Tuning
 
     nonisolated static let defaultPrefillStepSize = 512
-    nonisolated static let minimumAdaptivePrefillStepSize = 128
-
-    /// Scales the tuned prefill chunk size down when the actual prompt is small,
-    /// reducing peak memory without changing generation quality. Never exceeds
-    /// the tuned value.
-    nonisolated static func adaptivePrefillStepSize(
-        tuned: Int,
-        messages: [Chat.Message]
-    ) -> Int {
-        let approxTokens = messages.reduce(0) { partial, message in
-            partial + max(1, message.content.count / 4)
-        }
-        if approxTokens <= 0 {
-            return max(minimumAdaptivePrefillStepSize, min(tuned, 256))
-        }
-        var bucket = minimumAdaptivePrefillStepSize
-        while bucket < approxTokens && bucket < tuned {
-            bucket *= 2
-        }
-        return max(minimumAdaptivePrefillStepSize, min(tuned, bucket))
-    }
     nonisolated private static let tuningStartupDelayNanoseconds: UInt64 = 1_000_000_000
+    nonisolated private static let benchmarkPromptTokenCount = 2_048
+    nonisolated private static let benchmarkDecodeTokenCount = 16
+
     nonisolated private static func prefillTuningUserDefaultsKey(
         for modelID: String,
         deviceSupportProfile: MLXDeviceSupportProfile
@@ -74,13 +57,18 @@ extension MLXModelManager {
     ) -> Int? {
         GPU.maxRecommendedWorkingSetBytes() ?? Int(deviceSupportProfile.physicalMemoryBytes)
     }
+
     nonisolated internal struct TuningBenchmarkResult: Sendable {
         let candidate: Int
         let promptTokensPerSecond: Double
         let decodeTokensPerSecond: Double
         let totalLatency: TimeInterval
+        /// KV cache after the benchmark prompt.
+        let kvBytes: Int
+        /// Peak active memory beyond weights and KV cache.
+        let workspaceBytes: Int
+        /// Weights, KV cache and workspace together.
         let totalBytes: Int
-        let measurement: MLXLMCommon.WiredMemoryMeasurement
     }
 
     nonisolated internal static func selectFastestSafeCandidate(
@@ -115,89 +103,114 @@ extension MLXModelManager {
                 : lhs.candidate > rhs.candidate
         } ?? candidates[0]
     }
-    private func makeBenchmarkUserInput(
+
+    /// Repeats of a prompt unit needed for `targetTokenCount` tokens,
+    /// estimated from one sample of `sampleRepeats` units that encoded to
+    /// `sampleTokenCount` tokens.
+    nonisolated static func benchmarkRepeatCount(
+        targetTokenCount: Int,
+        sampleRepeats: Int,
+        sampleTokenCount: Int
+    ) -> Int {
+        let tokensPerRepeat = max(Double(sampleTokenCount) / Double(max(sampleRepeats, 1)), 0.01)
+        return max(1, Int((Double(targetTokenCount) / tokensPerRepeat).rounded(.up)))
+    }
+
+    /// A synthetic prompt of at least `targetTokenCount` tokens. One sample
+    /// encoding sizes it and one encoding verifies it, instead of
+    /// re-tokenizing a growing string in fixed increments.
+    private func makeBenchmarkPrompt(
         container: ModelContainer,
-        targetTokenCount: Int = 2_048
-    ) async -> UserInput {
-        var prompt = ""
-        var tokenCount = 0
+        targetTokenCount: Int = MLXModelManager.benchmarkPromptTokenCount
+    ) async -> String {
+        let unit = " hello"
+        let sampleRepeats = 128
+        let sampleTokenCount = await container.encode(String(repeating: unit, count: sampleRepeats)).count
+        var repeats = Self.benchmarkRepeatCount(
+            targetTokenCount: targetTokenCount,
+            sampleRepeats: sampleRepeats,
+            sampleTokenCount: sampleTokenCount
+        )
+        var prompt = String(repeating: unit, count: repeats)
+        var tokenCount = await container.encode(prompt).count
+        // Only an unusual tokenizer gets here: top up by the shortfall.
         while tokenCount < targetTokenCount {
-            // Approach the target in bounded increments. Doubling the whole
-            // prompt could make the tuning workload nearly twice as large as
-            // requested on tokenizers with roughly linear segmentation.
-            let remaining = targetTokenCount - tokenCount
-            prompt += String(repeating: " hello", count: min(128, remaining))
+            repeats += Self.benchmarkRepeatCount(
+                targetTokenCount: targetTokenCount - tokenCount,
+                sampleRepeats: sampleRepeats,
+                sampleTokenCount: sampleTokenCount
+            )
+            prompt = String(repeating: unit, count: repeats)
             tokenCount = await container.encode(prompt).count
         }
-        return UserInput(
-            chat: [.user(prompt)],
-            processing: UserInput.Processing()
-        )
+        return prompt
     }
 
-    private func benchmarkGeneration(
+    /// Prefills the benchmark prompt once, decodes a few tokens, and reads
+    /// speed and memory from that same pass. The previous separate memory
+    /// pass prefilled the whole prompt a second time per candidate.
+    nonisolated private static func measureTuningCandidate(
         container: ModelContainer,
-        userInput: UserInput,
-        parameters: GenerateParameters
-    ) async throws -> (promptTokensPerSecond: Double, decodeTokensPerSecond: Double, totalLatency: TimeInterval) {
-        try Task.checkCancellation()
-        let prepared = try await container.prepare(input: userInput)
-        let startedAt = Date()
-        let stream = try await container.generate(input: prepared, parameters: parameters)
-        var completionInfo: GenerateCompletionInfo?
-        for await generation in stream {
-            try Task.checkCancellation()
-            if case .info(let info) = generation {
-                completionInfo = info
-            }
-        }
-        let totalLatency = Date().timeIntervalSince(startedAt)
-        guard let completionInfo else {
-            throw GenerationError.invalidChatHistory
-        }
-        return (
-            promptTokensPerSecond: completionInfo.promptTokensPerSecond,
-            decodeTokensPerSecond: completionInfo.tokensPerSecond,
-            totalLatency: totalLatency
-        )
-    }
-
-    private func measureTuningCandidate(
-        container: ModelContainer,
-        userInput: UserInput,
+        prompt: String,
         parameters: GenerateParameters,
         candidate: Int
     ) async throws -> TuningBenchmarkResult {
-        let performanceResult = try await benchmarkGeneration(
-            container: container,
-            userInput: userInput,
-            parameters: parameters
-        )
         try Task.checkCancellation()
-        aggressivelyFreeMemory(reason: "tuning.candidate.between")
-        let memoryMeasurement: MLXLMCommon.WiredMemoryMeasurement = try await container.perform { context in
-            try await WiredMemoryUtils.tune(
-                userInput: userInput,
-                context: context,
-                parameters: parameters
+        return try await container.perform { context in
+            let input = try await context.processor.prepare(
+                input: UserInput(chat: [.user(prompt)], processing: UserInput.Processing())
+            )
+            let promptTokenCount = input.text.tokens.size
+            let weightBytes = context.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+            let startActive = Memory.activeMemory
+            Memory.peakMemory = 0
+
+            let cache = context.model.newCache(parameters: parameters)
+            let startedAt = Date()
+            // Prefill runs here; `prepare` checks for cancellation between chunks.
+            var iterator = try TokenIterator(
+                input: input, model: context.model, cache: cache, parameters: parameters
+            )
+            guard iterator.next() != nil else {
+                throw GenerationError.invalidChatHistory
+            }
+            let firstTokenAt = Date()
+            var decodedTokens = 0
+            while iterator.next() != nil {
+                try Task.checkCancellation()
+                decodedTokens += 1
+            }
+            MLX.Stream().synchronize()
+            let finishedAt = Date()
+
+            let cacheArrays = cache.flatMap { layer in
+                let arrays = layer.innerState()
+                return arrays.isEmpty ? layer.state : arrays
+            }
+            eval(cacheArrays)
+            let kvBytes = cacheArrays.reduce(0) { $0 + $1.nbytes }
+            let peakActive = max(Memory.peakMemory, startActive)
+            let workspaceBytes = max(0, peakActive - weightBytes - kvBytes)
+
+            let promptTime = firstTokenAt.timeIntervalSince(startedAt)
+            let decodeTime = finishedAt.timeIntervalSince(firstTokenAt)
+            return TuningBenchmarkResult(
+                candidate: candidate,
+                promptTokensPerSecond: promptTime > 0 ? Double(promptTokenCount) / promptTime : 0,
+                decodeTokensPerSecond: decodeTime > 0 ? Double(decodedTokens) / decodeTime : 0,
+                totalLatency: finishedAt.timeIntervalSince(startedAt),
+                kvBytes: kvBytes,
+                workspaceBytes: workspaceBytes,
+                totalBytes: max(0, weightBytes) + kvBytes + workspaceBytes
             )
         }
-
-        return TuningBenchmarkResult(
-            candidate: candidate,
-            promptTokensPerSecond: performanceResult.promptTokensPerSecond,
-            decodeTokensPerSecond: performanceResult.decodeTokensPerSecond,
-            totalLatency: performanceResult.totalLatency,
-            totalBytes: memoryMeasurement.totalBytes,
-            measurement: memoryMeasurement
-        )
     }
+
     private func defaultGenerationConfigurationForCurrentDevice(
         model: MLXModelInfo? = nil
     ) -> GenerationConfiguration {
         Self.generationConfiguration(
-            isEnabled: defaults.mlxEnableRotorQuant,
-            preferRotorQuant: shouldPreferRotorQuant,
+            rotorQuantEnabled: isRotorQuantEnabled,
             hasTools: false,
             hasMedia: false,
             memoryConstrained: false,
@@ -205,6 +218,27 @@ extension MLXModelManager {
             configuredMaxOutputTokens: defaults.mlxMaxOutputTokensLimit,
             configuredContextWindow: configuredContextWindowLimit(for: model),
             contextWindowLimitRaised: defaults.bool(forKey: AppSettingsKeys.overrideContextWindowLimit)
+        )
+    }
+
+    /// Parameters a plain text turn uses on this device: sampling, cache
+    /// layout and compression. Tuning and shader prewarm run with these so
+    /// they measure and compile what real generation runs.
+    func defaultGenerateParameters(
+        for model: MLXModelInfo,
+        maxTokens: Int,
+        prefillStepSize: Int
+    ) -> GenerateParameters {
+        let configuration = defaultGenerationConfigurationForCurrentDevice(model: model)
+        return Self.makeGenerateParameters(
+            maxTokens: maxTokens,
+            maxKVSize: configuration.maxKVSize,
+            cacheCompression: configuration.cacheCompression,
+            enableThinking: model.requiresReasoning,
+            includesMedia: false,
+            currentModelID: model.id,
+            prefillStepSize: prefillStepSize,
+            repetitionPenalty: defaults.mlxRepetitionPenaltyValue
         )
     }
 
@@ -222,6 +256,7 @@ extension MLXModelManager {
             "MLX tuning deferred until after first successful generation: id=\(model.id, privacy: .public) prefill=\(initialPrefillStepSize, privacy: .public)"
         )
     }
+
     func startDeferredTuningIfNeeded(
         container: ModelContainer,
         model: MLXModelInfo
@@ -245,77 +280,72 @@ extension MLXModelManager {
 
         deferredTuningModelID = nil
 
+        // Tuning only runs while no step size is persisted for this model and
+        // device, so the candidates always span the whole range.
         let initialPrefillStepSize = await inferenceWorker.prefillStepSize(for: model.id)
-        let persistedPrefill = Self.persistedPrefillStepSize(
-            for: model.id,
-            deviceSupportProfile: deviceSupportProfile,
-            defaults: defaults
-        )
-        let defaultGenerationConfiguration = defaultGenerationConfigurationForCurrentDevice(model: model)
-        let prefillCandidates = persistedPrefill.map { [$0] } ?? Array(Set([256, initialPrefillStepSize, 1024])).sorted()
+        let prefillCandidates = Array(Set([256, initialPrefillStepSize, 1024])).sorted()
+        let candidateParameters = prefillCandidates.map { candidate in
+            (candidate, defaultGenerateParameters(
+                for: model,
+                maxTokens: Self.benchmarkDecodeTokenCount,
+                prefillStepSize: candidate
+            ))
+        }
         let wiredMemoryCap = Self.recommendedWiredMemoryCapBytes(
             deviceSupportProfile: deviceSupportProfile
         )
 
+        let taskID = UUID()
+        tuningTaskID = taskID
+        // Main-actor isolated like this method; only the benchmark passes
+        // leave it, inside the model container.
         tuningTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
             defer {
-                Task { @MainActor [weak self] in
-                    self?.tuningTask = nil
+                // A newer task may have replaced this one after a cancel.
+                if self.tuningTaskID == taskID {
+                    self.tuningTask = nil
+                    self.tuningTaskID = nil
                 }
             }
 
             try? await Task.sleep(nanoseconds: Self.tuningStartupDelayNanoseconds)
             guard !Task.isCancelled else { return }
 
-            let canUseGPU = await MainActor.run { [weak self] in
-                self?.isApplicationActiveForGPUWork == true
-            }
-            guard canUseGPU else {
-                await MainActor.run {
-                    if self.tuningNeedsRetry(for: model) {
-                        self.deferredTuningModelID = model.id
-                    }
-                    self.logger.notice(
-                        "MLX deferred tuning skipped after app left foreground: id=\(model.id, privacy: .public)"
-                    )
+            guard self.isApplicationActiveForGPUWork else {
+                if self.tuningNeedsRetry(for: model) {
+                    self.deferredTuningModelID = model.id
                 }
+                self.logger.notice(
+                    "MLX deferred tuning skipped after app left foreground: id=\(model.id, privacy: .public)"
+                )
                 return
             }
 
-            await MainActor.run {
-                self.aggressivelyFreeMemory(reason: "tuning.start")
-            }
+            self.aggressivelyFreeMemory(reason: "tuning.start")
 
-            let benchmarkInput = await self.makeBenchmarkUserInput(container: container)
+            let benchmarkPrompt = await self.makeBenchmarkPrompt(container: container)
             var prefillResults: [TuningBenchmarkResult] = []
 
-            for candidate in prefillCandidates {
+            for (candidate, parameters) in candidateParameters {
                 guard !Task.isCancelled else { return }
-                let parameters = GenerateParameters(
-                    maxTokens: 16,
-                    maxKVSize: defaultGenerationConfiguration.maxKVSize,
-                    prefillStepSize: candidate
-                )
                 do {
-                    let result = try await self.measureTuningCandidate(
+                    let result = try await Self.measureTuningCandidate(
                         container: container,
-                        userInput: benchmarkInput,
+                        prompt: benchmarkPrompt,
                         parameters: parameters,
                         candidate: candidate
                     )
                     prefillResults.append(result)
+                    self.aggressivelyFreeMemory(reason: "tuning.candidate.between")
+                } catch is CancellationError {
+                    self.aggressivelyFreeMemory(reason: "tuning.cancelled")
+                    return
                 } catch {
-                    let logger = Logger(
-                        subsystem: Bundle.main.bundleIdentifier ?? "ChatLLM",
-                        category: "MLXModelManager"
-                    )
-                    logger.error(
+                    self.logger.error(
                         "MLX prefill tuning candidate failed: model=\(model.id, privacy: .public) prefill=\(candidate, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
                     )
-                    await MainActor.run {
-                        self.aggressivelyFreeMemory(reason: "tuning.prefill.failure")
-                    }
+                    self.aggressivelyFreeMemory(reason: "tuning.prefill.failure")
                 }
             }
 
@@ -327,8 +357,7 @@ extension MLXModelManager {
                 wiredMemoryCap: wiredMemoryCap,
                 preferLargerCandidateOnTie: true
             )
-
-            let selectedMeasurement = selectedPrefill.measurement
+            let activeBytesEstimate = selectedPrefill.kvBytes + selectedPrefill.workspaceBytes
 
             Self.storePersistedPrefillStepSize(
                 selectedPrefill.candidate,
@@ -339,28 +368,33 @@ extension MLXModelManager {
             await self.inferenceWorker.updateLoadedModelTuning(
                 modelID: model.id,
                 prefillStepSize: selectedPrefill.candidate,
-                activeBytesEstimate: selectedMeasurement.kvBytes + selectedMeasurement.workspaceBytes
+                activeBytesEstimate: activeBytesEstimate
             )
-            await MainActor.run {
-                self.logger.notice(
-                    "MLX tuning selected: model=\(model.id, privacy: .public) prefill=\(selectedPrefill.candidate, privacy: .public) active_bytes=\(selectedMeasurement.kvBytes + selectedMeasurement.workspaceBytes, privacy: .public)"
-                )
-                self.aggressivelyFreeMemory(reason: "tuning.complete")
-            }
+            self.logger.notice(
+                "MLX tuning selected: model=\(model.id, privacy: .public) prefill=\(selectedPrefill.candidate, privacy: .public) active_bytes=\(activeBytesEstimate, privacy: .public)"
+            )
+            self.aggressivelyFreeMemory(reason: "tuning.complete")
         }
     }
+
+    /// Cancels the running tuning task and forgets it, so its deferred reset
+    /// cannot clear a task started later.
+    func cancelTuningTask() {
+        tuningTask?.cancel()
+        tuningTask = nil
+        tuningTaskID = nil
+    }
+
     private var isApplicationActiveForGPUWork: Bool {
         UIApplication.shared.applicationState == .active
     }
 
     private func tuningNeedsRetry(for model: MLXModelInfo) -> Bool {
-        let persistedPrefill = Self.persistedPrefillStepSize(
+        Self.persistedPrefillStepSize(
             for: model.id,
             deviceSupportProfile: deviceSupportProfile,
             defaults: defaults
-        )
-        let needsPrefillTuning = persistedPrefill == nil
-        return needsPrefillTuning
+        ) == nil
     }
 
     func handleApplicationInactivity(reason: String) {
@@ -372,17 +406,22 @@ extension MLXModelManager {
             deferredTuningModelID = nil
         }
 
-        tuningTask?.cancel()
-        tuningTask = nil
+        cancelTuningTask()
         logger.notice("MLX paused deferred tuning: reason=\(reason, privacy: .public)")
     }
 
     func cancelDeferredTuningBeforeGeneration(for model: MLXModelInfo) async {
         guard let activeTuningTask = tuningTask else { return }
 
+        let activeTaskID = tuningTaskID
         activeTuningTask.cancel()
+        // The benchmark checks for cancellation between prefill chunks and
+        // decode steps, so this wait is short.
         await activeTuningTask.value
-        tuningTask = nil
+        if tuningTaskID == activeTaskID {
+            tuningTask = nil
+            tuningTaskID = nil
+        }
 
         if currentModel?.id == model.id,
            tuningNeedsRetry(for: model),

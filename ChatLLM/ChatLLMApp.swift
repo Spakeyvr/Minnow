@@ -23,9 +23,11 @@ final class ChatLLMAppDelegate: NSObject, UIApplicationDelegate {
             return
         }
 
-        BackgroundModelDownloadSession.shared.handleEventsForBackgroundSession(
-            completionHandler: completionHandler
-        )
+        // UIKit's handler is not Sendable. Wrapping it in a main-actor closure
+        // lets the download session hold it while only ever calling it here.
+        BackgroundModelDownloadSession.shared.handleEventsForBackgroundSession { @MainActor in
+            completionHandler()
+        }
 
         // Recreate the model manager promptly when iOS relaunches the app to
         // deliver background-session events. It reconnects to the persisted task.
@@ -44,8 +46,10 @@ struct ChatLLMApp: App {
     ])
 
     init() {
+        #if DEBUG
         // Reset test data before opening SQLite, never underneath a live store.
         Self.configureUITestStateIfNeeded()
+        #endif
         sharedModelContainer = Self.makeModelContainer()
     }
 
@@ -71,6 +75,9 @@ struct ChatLLMApp: App {
         .commands { ChatLLMCommands() }
     }
 
+    #if DEBUG
+    /// Wipes preferences, the Tavily key, chats and attachments for a UI test run. Debug
+    /// only, like the fixtures it prepares for: no shipping build can erase data this way.
     private static func configureUITestStateIfNeeded() {
         let arguments = ProcessInfo.processInfo.arguments
         guard arguments.contains("-ui-test-reset-app-state") else {
@@ -89,17 +96,27 @@ struct ChatLLMApp: App {
             UserDefaults.standard.set(true, forKey: AppSettingsKeys.hasCompletedOnboarding)
         }
     }
+    #endif
 
     private static func makeModelConfiguration() -> ModelConfiguration {
         ModelConfiguration(schema: appSchema, isStoredInMemoryOnly: false)
     }
 
+    /// Pause before the single retry, long enough for a briefly locked store file to free up.
+    private static let storeOpenRetryDelay: TimeInterval = 0.2
+
     private static func makeModelContainer() -> ModelContainer {
         let modelConfiguration = makeModelConfiguration()
         var lastError: Error?
-        // Retry once: a transient failure (for example a briefly locked file)
-        // must not be treated as a corrupt store.
-        for _ in 0..<2 {
+        // Retry once after a short pause: a transient failure (for example a briefly
+        // locked file) must not be treated as a corrupt store.
+        for attempt in 0..<2 {
+            if attempt > 0 {
+                storeLogger.error("Could not open SwiftData store, retrying: \(String(describing: lastError), privacy: .public)")
+                // App init is synchronous and nothing is on screen yet, so blocking here is
+                // the only way to wait; it only happens on this failure path.
+                Thread.sleep(forTimeInterval: storeOpenRetryDelay)
+            }
             do {
                 return try ModelContainer(for: appSchema, configurations: [modelConfiguration])
             } catch {
@@ -137,6 +154,7 @@ struct ChatLLMApp: App {
         }
     }
 
+    #if DEBUG
     private static func clearSwiftDataStoreIfNeeded() {
         let storeURL = Self.makeModelConfiguration().url
         for url in PersistentStoreRecovery.storeFileURLs(for: storeURL) where FileManager.default.fileExists(atPath: url.path) {
@@ -156,6 +174,7 @@ struct ChatLLMApp: App {
 
         try? FileManager.default.removeItem(at: attachmentsURL)
     }
+    #endif
 }
 
 /// Tracks a launch whose on-disk SwiftData store could not be opened, so the

@@ -61,10 +61,16 @@ final class Conversation {
     /// Every term must appear in the title or the messages, ignoring case and accents,
     /// so "cafe" finds "Café" and terms can be split between title and messages.
     func matchesSearch(_ terms: [String]) -> Bool {
-        let unmatched = terms.filter { !title.localizedStandardContains($0) }
+        var unmatched = terms.filter { !title.localizedStandardContains($0) }
         guard !unmatched.isEmpty else { return true }
-        // Only fault in the messages when the title alone doesn't match.
-        let text = searchableVisibleText
-        return unmatched.allSatisfy { text.localizedStandardContains($0) }
+        // Only fault in the messages when the title alone doesn't match. Each
+        // message is checked on its own (order doesn't matter for a match), and
+        // the scan stops as soon as every term has been found.
+        for message in messages where message.role != .system {
+            let text = message.userVisibleText
+            unmatched.removeAll { text.localizedStandardContains($0) }
+            if unmatched.isEmpty { return true }
+        }
+        return false
     }
 }

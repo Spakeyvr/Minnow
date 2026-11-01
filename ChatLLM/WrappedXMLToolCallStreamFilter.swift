@@ -9,7 +9,10 @@
 
 import Foundation
 
-actor WrappedXMLToolCallStreamFilter {
+/// A value type owned by the one stream it filters, so each chunk is handled
+/// synchronously instead of hopping to another actor.
+nonisolated struct WrappedXMLToolCallStreamFilter: Sendable {
+    /// Matched without regard to case, like the closing wrapper.
     private static let toolMarkupMarkers = [
         "<tool_call>",
         "<function=",
@@ -18,13 +21,21 @@ actor WrappedXMLToolCallStreamFilter {
         "</function>",
         "</tool_call>"
     ]
+    private static let longestMarkerUTF8Count = toolMarkupMarkers.map(\.utf8.count).max() ?? 0
 
+    /// A disabled filter passes every chunk through unchanged.
+    private let isEnabled: Bool
     private var pendingText = ""
     private var suppressingToolMarkup = false
     private var suppressedMarkup = ""
 
-    func consume(_ chunk: String) -> String? {
+    init(isEnabled: Bool = true) {
+        self.isEnabled = isEnabled
+    }
+
+    mutating func consume(_ chunk: String) -> String? {
         guard !chunk.isEmpty else { return nil }
+        guard isEnabled else { return chunk }
 
         if suppressingToolMarkup {
             suppressedMarkup += chunk
@@ -43,24 +54,23 @@ actor WrappedXMLToolCallStreamFilter {
             return visibleText.isEmpty ? nil : visibleText
         }
 
-        let safePrefixLength = Self.safePrefixLength(in: pendingText)
-        guard safePrefixLength > 0 else {
+        let safeEnd = Self.safePrefixEnd(in: pendingText)
+        guard safeEnd > pendingText.startIndex else {
             return nil
         }
 
-        let safeEnd = pendingText.index(pendingText.startIndex, offsetBy: safePrefixLength)
         let safeChunk = String(pendingText[..<safeEnd])
         pendingText = String(pendingText[safeEnd...])
         return safeChunk.isEmpty ? nil : safeChunk
     }
 
-    func didDispatchToolCall() {
+    mutating func didDispatchToolCall() {
         pendingText = ""
         suppressedMarkup = ""
         suppressingToolMarkup = false
     }
 
-    func finish() -> String? {
+    mutating func finish() -> String? {
         defer {
             pendingText = ""
             suppressedMarkup = ""
@@ -100,7 +110,7 @@ actor WrappedXMLToolCallStreamFilter {
     /// the model framework fails to emit a corresponding `.toolCall` event.
     /// Any following assistant text is fed back through the normal marker
     /// boundary logic so partial markers remain buffered safely.
-    private func resumeAfterClosedToolCallIfPossible() -> String? {
+    private mutating func resumeAfterClosedToolCallIfPossible() -> String? {
         guard let closingRange = suppressedMarkup.range(
             of: "</tool_call>",
             options: [.caseInsensitive]
@@ -117,36 +127,20 @@ actor WrappedXMLToolCallStreamFilter {
 
     private static func firstMarkerRange(in text: String) -> Range<String.Index>? {
         toolMarkupMarkers
-            .compactMap { marker in text.range(of: marker) }
+            .compactMap { marker in text.range(of: marker, options: [.caseInsensitive]) }
             .min { $0.lowerBound < $1.lowerBound }
     }
 
-    private static func safePrefixLength(in text: String) -> Int {
-        guard text.contains("<") else {
-            return text.count
+    /// End of the text that cannot be the start of a marker split across
+    /// chunks. Only the tail after the last `<` can be one, so the search
+    /// stays within the longest marker's length instead of the whole buffer.
+    private static func safePrefixEnd(in text: String) -> String.Index {
+        guard let lastOpen = text.utf8.lastIndex(of: UInt8(ascii: "<")) else {
+            return text.endIndex
         }
-
-        let suffixLength = longestMarkerPrefixSuffix(in: text)
-        return text.count - suffixLength
-    }
-
-    private static func longestMarkerPrefixSuffix(in text: String) -> Int {
-        let maxSuffixLength = min(
-            text.count,
-            toolMarkupMarkers.map(\.count).max() ?? 0
-        )
-        guard maxSuffixLength > 0 else {
-            return 0
-        }
-
-        for suffixLength in stride(from: maxSuffixLength, through: 1, by: -1) {
-            let suffixStart = text.index(text.endIndex, offsetBy: -suffixLength)
-            let suffix = String(text[suffixStart...])
-            if toolMarkupMarkers.contains(where: { $0.hasPrefix(suffix) }) {
-                return suffixLength
-            }
-        }
-
-        return 0
+        let tail = text.utf8[lastOpen...]
+        guard tail.count <= longestMarkerUTF8Count else { return text.endIndex }
+        let tailText = String(decoding: tail, as: UTF8.self).lowercased()
+        return toolMarkupMarkers.contains(where: { $0.hasPrefix(tailText) }) ? lastOpen : text.endIndex
     }
 }

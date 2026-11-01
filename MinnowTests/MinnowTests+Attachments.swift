@@ -1,0 +1,92 @@
+//
+//  MinnowTests+Attachments.swift
+//  MinnowTests
+//
+//  Split out of MinnowTests.swift; part of the single @Suite(.serialized) MinnowTests suite.
+//
+
+import Testing
+import Foundation
+import SwiftUI
+import SwiftData
+import WebKit
+import UIKit
+import FoundationModels
+@testable import Minnow
+
+extension MinnowTests {
+    @Test func attachmentStoresAContainerAgnosticFileName() {
+        let attachment = MessageAttachment(
+            type: .image,
+            fileURL: URL(fileURLWithPath: "/var/mobile/Containers/Data/Application/OLD/Documents/Attachments/pic.jpg"),
+            fileName: "pic.jpg"
+        )
+
+        // Only the file name survives; the old container path must not.
+        #expect(!attachment.fileURL.path.contains("OLD"))
+        #expect(attachment.fileURL.lastPathComponent == "pic.jpg")
+    }
+
+    @Test func attachmentResolvesItsFileInsideTheCurrentContainer() throws {
+        let attachment = MessageAttachment(
+            type: .image,
+            fileURL: URL(fileURLWithPath: "/an/old/container/pic.jpg"),
+            fileName: "pic.jpg"
+        )
+
+        let documents = try FileManager.default.url(
+            for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: false
+        )
+        let expected = documents.appendingPathComponent("Attachments").appendingPathComponent("pic.jpg")
+
+        #expect(attachment.actualFileURL.standardizedFileURL == expected.standardizedFileURL)
+    }
+
+    // MARK: - Image store
+
+    @Test func imageStoreSavesAReadableDownscaledImage() async throws {
+        let store = makeImageStore()
+        let url = try await store.save(image: makeTestImage(width: 2_000, height: 1_000), maxDimension: 200)
+
+        let metrics = await store.imageMetrics(at: url)
+        let unwrapped = try #require(metrics)
+        #expect(max(unwrapped.width, unwrapped.height) <= 200)
+        #expect(unwrapped.byteSize > 0)
+        #expect(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    @Test func recentlySavedImagesSurviveOrphanCleanup() async throws {
+        // A just-attached image is not yet referenced by a saved message. The
+        // protection window is what stops cleanup from deleting it underneath.
+        let store = makeImageStore()
+        let url = try await store.save(image: makeTestImage(width: 60, height: 40), maxDimension: 60)
+
+        try await store.cleanupOrphanedFiles(referencedURLs: [])
+
+        #expect(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    @Test func referencedImagesSurviveCleanupWhenPathsAreSpelledDifferently() async throws {
+        // On device the directory listing and the stored reference can name the
+        // same container through /private/var and /var; that must not orphan the file.
+        let store = makeImageStore()
+        let url = try await store.save(image: makeTestImage(width: 60, height: 40), maxDimension: 60)
+        let old = Date().addingTimeInterval(-3_600)
+        try FileManager.default.setAttributes([.creationDate: old, .modificationDate: old], ofItemAtPath: url.path)
+
+        let differentlySpelled = URL(fileURLWithPath: "/private" + url.path)
+        try await store.cleanupOrphanedFiles(referencedURLs: [differentlySpelled])
+
+        #expect(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    @Test func imageStoreRejectsDegenerateImages() async {
+        let store = makeImageStore()
+        await #expect(throws: (any Error).self) {
+            _ = try await store.save(image: UIImage())
+        }
+    }
+
+    // MARK: - Conversation editing guards
+
+}

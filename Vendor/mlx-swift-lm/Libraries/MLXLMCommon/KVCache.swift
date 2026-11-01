@@ -2220,7 +2220,7 @@ public final class RotorQuantKVCache: BaseKVCache, AttentionCapableKVCache {
         // Without this, a full exact tail grows one token at a time until the
         // first flush, briefly overlapping each old and replacement allocation.
         let capacity = max(exactBufferSize + exactFlushSlack, exactCapacity, exactCount, 1)
-        // ChatLLM patch: this runs on every ingest; compare dimensions before
+        // Minnow patch: this runs on every ingest; compare dimensions before
         // building shape arrays for the common already-allocated case.
         if let exactKeys, let exactValues,
            exactKeys.dtype == dtype, exactValues.dtype == dtype,
@@ -3267,7 +3267,7 @@ public func loadPromptCache(
         }
 
         if cache is RotorQuantKVCache, i < cacheInfo.count {
-            // ChatLLM patch: metaState carries the saved bit widths and buffer
+            // Minnow patch: metaState carries the saved bit widths and buffer
             // sizes. Applying it first builds the quantizers once with them;
             // setting state first built them with the defaults, then rebuilt.
             cache.metaState = cacheInfo[i]

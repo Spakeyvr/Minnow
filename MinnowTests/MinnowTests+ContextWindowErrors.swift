@@ -1,0 +1,99 @@
+//
+//  MinnowTests+ContextWindowErrors
+//  MinnowTests
+//
+//  Part of the single @Suite(.serialized) MinnowTests suite.
+//
+
+import Testing
+import Foundation
+import FoundationModels
+@testable import Minnow
+
+/// Fails every request the way Foundation Models reports an overflow.
+private struct ContextOverflowGenerator: LLMGenerator {
+    func streamResponse(to request: LLMRequest, tools: [any FoundationModelTool]) async throws -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: NSError(
+                domain: "FoundationModels.LanguageModelSession.GenerationError",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Exceeded model context window size"]
+            ))
+        }
+    }
+}
+
+extension MinnowTests {
+    @Test func appleIntelligenceOverflowMessageNamesTheAppleModelAndItsFixes() throws {
+        let message = try #require(
+            ChatViewModel.ContextWindowError(tokenLimit: 4_096, backend: .appleIntelligence).errorDescription
+        )
+
+        #expect(message.contains("Apple Intelligence"))
+        #expect(message.contains("Attach fewer images"))
+        #expect(!message.contains("MLX"))
+        #expect(!message.contains("Context Window setting"))
+    }
+
+    @Test func mlxOverflowMessageKeepsTheContextWindowSettingAdvice() throws {
+        let message = try #require(
+            ChatViewModel.ContextWindowError(tokenLimit: 2_048, backend: .mlx).errorDescription
+        )
+
+        #expect(message.contains("MLX"))
+        #expect(message.contains("Lower the Context Window setting"))
+    }
+
+    @Test func appleIntelligenceReplyThatOverflowsShowsTheAppleMessage() async throws {
+        let viewModel = try makeViewModel(generator: ContextOverflowGenerator())
+
+        await viewModel.send(userText: "Describe these photos")
+
+        let reply = try #require(viewModel.conversation.messages.first { $0.role == .assistant })
+        let error = try #require(reply.generationError)
+        #expect(error.contains("Apple Intelligence"))
+        #expect(!error.contains("MLX"))
+    }
+}
+
+extension MinnowTests {
+    @Test func typedFoundationModelErrorsAreRecognizedWhateverTheirDescription() throws {
+        let viewModel = try makeViewModel()
+        let overflow = LanguageModelError.contextSizeExceeded(
+            .init(contextSize: 4_096, tokenCount: 5_000, debugDescription: "Kontextfenster überschritten")
+        )
+        let guardrail = LanguageModelError.guardrailViolation(.init(debugDescription: "Inhalt blockiert"))
+
+        #expect(viewModel.isContextWindowError(overflow))
+        #expect(!viewModel.isContextWindowError(guardrail))
+        #expect(OnDeviceLLMGenerator.isSafetyModerationError(guardrail))
+        #expect(!OnDeviceLLMGenerator.isSafetyModerationError(overflow))
+    }
+}
+
+extension MinnowTests {
+    @Test func overflowMessageGroupsDigitsForTheAppLanguage() throws {
+        // The test environment starts in English and restores it for the next test.
+        let english = try #require(ChatViewModel.ContextWindowError(tokenLimit: 8_192, backend: .appleIntelligence).errorDescription)
+        #expect(english.contains("about 8,192 tokens"))
+        #expect(english.contains("response preferences"))
+
+        AppLanguage.overrideCurrent(with: .german)
+        let german = try #require(ChatViewModel.ContextWindowError(tokenLimit: 8_192, backend: .mlx).errorDescription)
+        #expect(german.contains("etwa 8.192 Tokens"))
+        #expect(german.contains("Antwortvorgaben"))
+    }
+}
+
+extension MinnowTests {
+    @Test func downloadSizeMismatchGroupsByteCountsForTheAppLanguage() throws {
+        // The test environment pins the interface language to English.
+        let message = try #require(ModelDownloader.DownloadError.incorrectFileSize(
+            file: "model.safetensors",
+            expected: 2_660_000_000,
+            actual: 1_200_000
+        ).errorDescription)
+
+        #expect(message.contains("expected 2,660,000,000 bytes, received 1,200,000 bytes"))
+    }
+}

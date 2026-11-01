@@ -1,0 +1,216 @@
+//
+//  MinnowTests+ToolCalling
+//  MinnowTests
+//
+//  Split out of MinnowTests.swift; part of the single @Suite(.serialized) MinnowTests suite.
+//
+
+import Testing
+import Foundation
+import MLXLMCommon
+import SwiftUI
+import SwiftData
+import WebKit
+import UIKit
+import FoundationModels
+@testable import Minnow
+
+extension MinnowTests {
+    @Test func qwenToolTemplateInspectionPrefersXMLFunctionFormat() {
+        let packageContents = """
+        <tool_call>
+        <function=webSearch>
+        <parameter=query>
+        latest OpenAI model
+        </parameter>
+        </function>
+        </tool_call>
+        """
+
+        let inferredFormat = MLXModelManager.inferToolCallFormat(
+            packageContents: packageContents,
+            modelType: "qwen3_5"
+        )
+
+        #expect(inferredFormat == .xmlFunction)
+        #expect(MLXModelManager.usesWrappedXMLToolCallTemplate(packageContents: packageContents))
+    }
+
+    @Test func smolLM3ToolTemplateInspectionPrefersJSONToolCalls() {
+        let packageContents = """
+        <tool_call>
+        {"name": "webSearch", "arguments": {"query": "latest Swift release"}}
+        </tool_call>
+        """
+
+        let inferredFormat = MLXModelManager.inferToolCallFormat(
+            packageContents: packageContents,
+            modelType: "smollm3"
+        )
+
+        #expect(inferredFormat == .json)
+        #expect(!MLXModelManager.usesWrappedXMLToolCallTemplate(packageContents: packageContents))
+    }
+
+    @Test func wrappedXMLToolCallStreamFilterSuppressesToolMarkup() {
+        var filter = WrappedXMLToolCallStreamFilter()
+
+        let firstChunk = filter.consume("I will check that.\n<tool")
+        let secondChunk = filter.consume("_call>\n<function=webSearch>")
+        let thirdChunk = filter.consume("\n<parameter=query>\nlatest OpenAI model\n</parameter>")
+        filter.didDispatchToolCall()
+        let trailingChunk = filter.finish()
+
+        #expect(firstChunk == "I will check that.\n")
+        #expect(secondChunk == nil)
+        #expect(thirdChunk == nil)
+        #expect(trailingChunk == nil)
+    }
+
+    @Test func wrappedXMLToolCallStreamFilterResumesAfterClosedWrapperWithoutToolEvent() {
+        var filter = WrappedXMLToolCallStreamFilter()
+
+        let visible = filter.consume(
+            "Before <tool_call><function=webSearch></function></tool_call>After"
+        )
+        let trailing = filter.finish()
+
+        #expect(visible == "Before After")
+        #expect(trailing == nil)
+    }
+
+    @Test func wrappedXMLToolCallStreamFilterRecoversTrailingTextAfterMalformedOuterWrapper() {
+        var filter = WrappedXMLToolCallStreamFilter()
+
+        let visible = filter.consume(
+            "Before <tool_call><function=webSearch></function>After"
+        )
+        let trailing = filter.finish()
+
+        #expect(visible == "Before ")
+        #expect(trailing == "After")
+    }
+
+    @Test func mlxToolLoopDisablesToolsOnlyAfterSearchLimitResponse() {
+        #expect(
+            MLXModelManager.shouldDisableTools(
+                after: AppWebSearchToolBridge.searchLimitToolResponse(limit: AppWebSearchToolBridge.maxInvocations)
+            )
+        )
+        #expect(
+            !MLXModelManager.shouldDisableTools(
+                after: AppWebSearchToolBridge.invalidArgumentsToolResponse()
+            )
+        )
+    }
+
+    @Test func qwenWrappedToolResponseContentUsesExpectedEnvelope() {
+        let content = MLXModelManager.wrappedToolResponseContent("Search result body")
+
+        #expect(content == "<tool_response>\nSearch result body\n</tool_response>")
+    }
+
+    @Test func qwenToolResponsesReuseWrappedUserPromptCompatibilityPath() throws {
+        let manager = makeModelManager()
+        let model = try #require(manager.model(withID: "qwen3.5-2b-4bit"))
+
+        let content = MLXModelManager.toolResponsePromptContent(
+            for: model,
+            toolResult: "Search result body"
+        )
+        let role = MLXModelManager.toolResponsePromptRole(for: model)
+
+        #expect(content == "<tool_response>\nSearch result body\n</tool_response>")
+        #expect(role == .user)
+    }
+
+    @Test func qwenToolResponsesRequireExplicitMessageHistoryAcrossToolLoop() throws {
+        let manager = makeModelManager()
+        let model = try #require(manager.model(withID: "qwen3.5-2b-4bit"))
+
+        #expect(MLXModelManager.requiresExplicitMessageHistoryForToolLoop(for: model))
+    }
+
+    @Test func boundedExplicitToolLoopReleasesAllPersistentSessionsBeforePrefill() {
+        let scope = MLXInferenceWorker.persistentSessionReleaseScope(
+            usesExplicitMessageHistory: true,
+            maxKVSize: 4096
+        )
+
+        #expect(scope == .all)
+    }
+
+    @Test func unboundedExplicitToolLoopOnlyReleasesCurrentConversationSession() {
+        let scope = MLXInferenceWorker.persistentSessionReleaseScope(
+            usesExplicitMessageHistory: true,
+            maxKVSize: nil
+        )
+
+        #expect(scope == .conversation)
+    }
+
+    @Test func nativeToolLoopPreservesPersistentSessions() {
+        let scope = MLXInferenceWorker.persistentSessionReleaseScope(
+            usesExplicitMessageHistory: false,
+            maxKVSize: 4096
+        )
+
+        #expect(scope == .none)
+    }
+
+    @Test func lfm25ToolResponsesUseNativeToolRole() throws {
+        let manager = makeModelManager()
+        let model = try #require(manager.model(withID: "lfm2.5-2.6b-4bit"))
+
+        let content = MLXModelManager.toolResponsePromptContent(
+            for: model,
+            toolResult: "Search result body"
+        )
+        let role = MLXModelManager.toolResponsePromptRole(for: model)
+
+        #expect(content == "Search result body")
+        #expect(role == .tool)
+        // Appending only the tool turn to a live session re-renders BOS and the
+        // tool list mid-conversation, so LFM rebuilds the prompt per tool round.
+        #expect(MLXModelManager.requiresExplicitMessageHistoryForToolLoop(for: model))
+    }
+
+    @Test func nonQwenModelsKeepNativeToolRoleForToolResponses() {
+        let nonQwenModel = MLXModelManager.MLXModelInfo(
+            id: "test-model",
+            name: "Test",
+            localDirName: "TestModel",
+            hfRepoId: "example/test-model",
+            parameters: "1B",
+            downloadSizeLabel: "1 GB",
+            loadPolicy: .qwenMultimodal,
+            description: "Test model",
+            contextLength: 4096,
+            isAvailable: true,
+            supportsReasoning: false,
+            supportsNativeImages: false,
+            requiredProcessorClass: nil,
+            minimumPhoneMemoryBytes: nil,
+            minimumPhoneMemoryForToolCallsBytes: nil
+        )
+
+        let content = MLXModelManager.toolResponsePromptContent(
+            for: nonQwenModel,
+            toolResult: "Search result body"
+        )
+        let role = MLXModelManager.toolResponsePromptRole(for: nonQwenModel)
+
+        #expect(content == "Search result body")
+        #expect(role == .tool)
+        #expect(!MLXModelManager.requiresExplicitMessageHistoryForToolLoop(for: nonQwenModel))
+    }
+
+    @Test func mlxToolLoopHasHardStopResponse() {
+        let response = MLXModelManager.excessiveToolCallToolResponse(
+            maximum: MLXModelManager.maxToolInvocationsPerResponse
+        )
+
+        #expect(response.contains("limit reached"))
+        #expect(response.contains("\(MLXModelManager.maxToolInvocationsPerResponse)"))
+    }
+}

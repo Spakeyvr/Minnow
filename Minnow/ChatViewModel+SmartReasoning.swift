@@ -1,0 +1,452 @@
+//
+//  ChatViewModel+SmartReasoning.swift
+//  Minnow
+//
+//  Created by Nevio on 10/24/25.
+//
+
+import Foundation
+import os
+
+// Cached regexes for parseReasoningResponse (compiled once at app launch)
+// swiftlint:disable force_try
+private let _parseReasoningRegex = try! NSRegularExpression(
+    pattern: #"<(?:thinking|think)>(.*?)</(?:thinking|think)>\s*(?:Final answer:\s*)?(.*?)$"#,
+    options: [.dotMatchesLineSeparators]
+)
+
+// swiftlint:enable force_try
+
+extension ChatViewModel {
+
+    // MARK: - Smart Reasoning
+
+    /// Whether a reply should reason: never on a backend or model without reasoning, always
+    /// when the model requires it or the chat's Reasoning toggle is on, and with Smart
+    /// Reasoning only when the prompt looks like it needs it. Without a prompt (a reply
+    /// with no preceding user message) Smart Reasoning has nothing to judge.
+    internal func shouldUseReasoningForPrompt(_ userText: String?) -> Bool {
+        let backendBridge = self.backendBridge
+        guard backendBridge.reasoningAvailable else { return false }
+
+        if backendBridge.reasoningRequired || conversation.reasoningMode { return true }
+        guard conversation.smartReasoningMode, let userText else { return false }
+
+        // Smart reasoning currently uses a local heuristic and only runs for MLX/Qwen thinking models.
+        let needsReasoning = Self.promptNeedsReasoning(userText)
+        logger.debug("Smart reasoning heuristic: needs_reasoning=\(needsReasoning, privacy: .public)")
+        return needsReasoning
+    }
+
+    /// Heuristic for determining whether an MLX reasoning model should be used.
+    /// Keywords match on word boundaries, so "ios" doesn't fire on "serious" or
+    /// "fix" on "prefix"; task keywords also match inflections ("fixing", "errors").
+    /// Covers every interface language, since people usually write in theirs.
+    nonisolated static func promptNeedsReasoning(_ userText: String) -> Bool {
+        let text = normalizedForKeywordMatching(userText)
+
+        // Simple questions that definitely don't need reasoning
+        let simplePatterns = [
+            "what is", "what are", "who is", "who was", "when was", "when is",
+            "hello", "hi", "hey", "thanks", "thank you", "goodbye", "bye",
+            // German
+            "was ist", "was sind", "wer ist", "wer war", "wann ist", "wann war",
+            "hallo", "danke", "tschüss",
+            // Spanish
+            "qué es", "qué son", "quién es", "quién fue", "cuándo es", "cuándo fue",
+            "hola", "gracias", "adiós"
+        ]
+
+        let isSimpleQuestion = simplePatterns.contains { text.hasPrefix(" \($0) ") }
+        if isSimpleQuestion && userText.count < 50 {
+            return false
+        }
+
+        // Keywords that often indicate complex tasks requiring reasoning
+        let complexityKeywords = [
+            "debug", "fix", "optimize", "improve", "refactor", "architecture",
+            "design pattern", "algorithm", "performance", "error", "issue", "problem",
+            "compare", "analyze", "evaluate", "trade off", "pros and cons",
+            "best practice", "approach", "strategy", "implementation",
+            "why does", "why is", "how should", "what's wrong", "what's the best",
+            "step by step", "walk through", "explain how", "show me how",
+            // German; stems also match their inflections
+            "behebe", "beheben", "optimier", "verbesser", "fehler", "vergleich",
+            "analysier", "bewerte", "vor und nachteile", "ansatz", "strategie",
+            "implementier", "warum funktioniert", "schritt für schritt", "erkläre wie",
+            // Spanish
+            "depura", "arregla", "corrige", "optimiza", "mejora", "compara", "analiza",
+            "evalúa", "ventajas y desventajas", "enfoque", "estrategia", "implementa",
+            "por qué no", "paso a paso", "explica cómo"
+        ]
+
+        // Mathematical or logical indicators
+        let logicalKeywords = [
+            "calculate", "solve", "equation", "formula", "logic", "reasoning",
+            "proof", "derive", "determine", "find the", "compute",
+            // German
+            "berechne", "löse", "gleichung", "formel", "beweis", "herleit", "bestimme",
+            // Spanish
+            "calcula", "resuelve", "ecuación", "fórmula", "demuestra", "demostración",
+            "deriva", "determina"
+        ]
+
+        // Code-related complexity indicators; whole words only, since several
+        // ("class", "struct", "extension") start ordinary words.
+        let codeKeywords = [
+            "swift", "swiftui", "uikit", "appkit", "xcode", "ios", "macos",
+            "function", "class", "struct", "protocol", "extension", "enum",
+            "async", "await", "combine", "coredata", "swiftdata"
+        ]
+
+        // Check for complexity indicators
+        let hasComplexityKeyword = complexityKeywords.contains { text.contains(" \($0)") }
+        let hasLogicalKeyword = logicalKeywords.contains { text.contains(" \($0)") }
+        let hasCodeKeyword = codeKeywords.contains { keyword in
+            ["", "s", "es"].contains { text.contains(" \(keyword)\($0) ") }
+        }
+
+        // Additional heuristics
+        let hasQuestionWords = [
+            "how", "why", "what", "what's", "wie", "warum", "was", "cómo", "por qué", "qué"
+        ].contains { text.contains(" \($0) ") }
+        let isLongQuery = userText.count > 100
+        let hasMultipleSentences = userText.components(separatedBy: CharacterSet(charactersIn: ".!?")).count > 2
+
+        // Combine heuristics - be somewhat conservative
+        if hasComplexityKeyword || hasLogicalKeyword {
+            return true
+        }
+
+        if hasCodeKeyword && (hasQuestionWords || isLongQuery) {
+            return true
+        }
+
+        return isLongQuery && hasMultipleSentences && hasQuestionWords
+    }
+
+    /// Lowercased words separated by single spaces, with a space at both ends so
+    /// `" word"` matches only at the start of a word.
+    private nonisolated static func normalizedForKeywordMatching(_ text: String) -> String {
+        let words = text.lowercased()
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "'")).inverted)
+            .filter { !$0.isEmpty }
+        return " " + words.joined(separator: " ") + " "
+    }
+
+    // MARK: - Reasoning Response Parsing
+
+    private func parseReasoningResponse(_ text: String) -> (reasoning: String?, finalAnswer: String?) {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else {
+            return (nil, nil)
+        }
+
+        // DEBUG: Log what we're parsing to diagnose short answer issues
+        if trimmedText.count < 200 {
+            logger.debug("parseReasoningResponse input chars: \(trimmedText.count, privacy: .public)")
+        }
+
+        // Check all tag variants (Qwen3.5 uses <think>, older paths use <thinking>)
+        let hasOpenThinking  = trimmedText.range(of: "<thinking>",  options: .caseInsensitive) != nil
+        let hasCloseThinking = trimmedText.range(of: "</thinking>", options: .caseInsensitive) != nil
+        let hasOpenThink     = trimmedText.range(of: "<think>",     options: .caseInsensitive) != nil
+        let hasCloseThink    = trimmedText.range(of: "</think>",    options: .caseInsensitive) != nil
+
+        // In-progress: opening tag present but closing tag not yet arrived
+        let inProgressTag: String? = (hasOpenThinking && !hasCloseThinking) ? "<thinking>" :
+                                     (hasOpenThink    && !hasCloseThink)    ? "<think>"    : nil
+        if let openTag = inProgressTag,
+           let openRange = trimmedText.range(of: openTag, options: .caseInsensitive) {
+            let after = String(trimmedText[openRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (after.isEmpty ? nil : after, nil)
+        }
+
+        // MLX path: opening <think> was in the prompt prefix so only </think> appears in output.
+        // Split at the first </think> — everything before is reasoning, everything after is the answer.
+        if !hasOpenThinking && !hasOpenThink && hasCloseThink,
+           let closeRange = trimmedText.range(of: "</think>", options: .caseInsensitive) {
+            let reasoning = String(trimmedText[..<closeRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let answer    = String(trimmedText[closeRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (reasoning.isEmpty ? nil : reasoning, answer.isEmpty ? nil : answer)
+        }
+
+        // No recognized tags → plain answer
+        guard (hasOpenThinking && hasCloseThinking) || (hasOpenThink && hasCloseThink) else {
+            return (nil, trimmedText)
+        }
+
+        // Full pattern match for both tag variants
+        let range = NSRange(trimmedText.startIndex..<trimmedText.endIndex, in: trimmedText)
+
+        if let match = _parseReasoningRegex.firstMatch(in: trimmedText, options: [], range: range),
+           match.numberOfRanges >= 3 {
+
+            var reasoning: String? = nil
+            var finalAnswer: String? = nil
+
+            // Safely extract reasoning
+            let reasoningRange = match.range(at: 1)
+            if reasoningRange.location != NSNotFound,
+               let swiftRange = Range(reasoningRange, in: trimmedText) {
+                reasoning = String(trimmedText[swiftRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if reasoning?.isEmpty == true { reasoning = nil }
+            }
+
+            // Safely extract final answer
+            let answerRange = match.range(at: 2)
+            if answerRange.location != NSNotFound,
+               let swiftRange = Range(answerRange, in: trimmedText) {
+                finalAnswer = String(trimmedText[swiftRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if finalAnswer?.isEmpty == true { finalAnswer = nil }
+            }
+
+            // DEBUG: Log extracted values for short responses
+            if (reasoning?.count ?? 0) < 200 || (finalAnswer?.count ?? 0) < 100 {
+                logger.debug("parseReasoningResponse extracted: reasoning=\(reasoning?.count ?? 0, privacy: .public) finalAnswer=\(finalAnswer?.count ?? 0, privacy: .public)")
+            }
+
+            return (reasoning, finalAnswer)
+        }
+
+        // If the pattern failed, treat as final answer
+        return (nil, trimmedText)
+    }
+
+    internal static func parseReasoningResponseForSearchSessionText(_ text: String) -> (reasoning: String?, finalAnswer: String?) {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else {
+            return (nil, nil)
+        }
+
+        let closeTag = "</think>"
+        let altCloseTag = "</thinking>"
+        let lastThinkClose = trimmedText.range(of: closeTag, options: [.caseInsensitive, .backwards])
+        let lastThinkingClose = trimmedText.range(of: altCloseTag, options: [.caseInsensitive, .backwards])
+        let lastCloseRange: Range<String.Index>? = {
+            switch (lastThinkClose, lastThinkingClose) {
+            case let (.some(a), .some(b)):
+                return a.lowerBound > b.lowerBound ? a : b
+            case let (.some(a), nil):
+                return a
+            case let (nil, .some(b)):
+                return b
+            case (nil, nil):
+                return nil
+            }
+        }()
+
+        guard let closeRange = lastCloseRange else {
+            let reasoningOnly = ReasoningTextSanitizer.string(from: trimmedText)
+            return (reasoningOnly.isEmpty ? nil : reasoningOnly, nil)
+        }
+
+        let beforeClose = ReasoningTextSanitizer.string(
+            from: String(trimmedText[..<closeRange.lowerBound])
+        )
+        let afterClose = String(trimmedText[closeRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let paragraphs = afterClose
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var reasoningParts: [String] = beforeClose.isEmpty ? [] : [beforeClose]
+        var answerParts: [String] = []
+
+        for paragraph in paragraphs {
+            if answerParts.isEmpty && looksLikeReasoningContinuation(paragraph) {
+                reasoningParts.append(paragraph)
+            } else {
+                answerParts.append(paragraph)
+            }
+        }
+
+        let reasoning = reasoningParts.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        var answer = answerParts.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if answer.lowercased().hasPrefix("final answer:") {
+            answer = String(answer.dropFirst("final answer:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return (reasoning.isEmpty ? nil : reasoning, answer.isEmpty ? nil : answer)
+    }
+
+    internal static func reasoningCloseTagCount(in text: String) -> Int {
+        // Searches case-insensitively in place instead of lowercasing a copy of
+        // the whole output on every repaint.
+        occurrenceCount(of: "</think>", in: text) + occurrenceCount(of: "</thinking>", in: text)
+    }
+
+    private static func occurrenceCount(of needle: String, in text: String) -> Int {
+        guard !needle.isEmpty else { return 0 }
+        var count = 0
+        var searchStart = text.startIndex
+
+        while let range = text.range(of: needle, options: .caseInsensitive, range: searchStart..<text.endIndex) {
+            count += 1
+            searchStart = range.upperBound
+        }
+
+        return count
+    }
+
+    /// True when the output stops inside a reasoning block: an opening tag with no close
+    /// after it, or (when the prompt itself opens the block, as MLX does) no close at all.
+    nonisolated static func outputEndsInsideReasoning(_ text: String, reasoningOpensInPrompt: Bool) -> Bool {
+        // "<think" also matches "<thinking>", and "</think" matches "</thinking>".
+        let lastOpen = text.range(of: "<think", options: [.caseInsensitive, .backwards])
+        guard let lastClose = text.range(of: "</think", options: [.caseInsensitive, .backwards]) else {
+            return reasoningOpensInPrompt || lastOpen != nil
+        }
+        guard let lastOpen else { return false }
+        return lastOpen.lowerBound > lastClose.lowerBound
+    }
+
+    private static func looksLikeReasoningContinuation(_ text: String) -> Bool {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return false }
+
+        let reasoningPrefixes = [
+            "let me", "i should", "i need to", "i'll", "i will", "now i",
+            "i should check", "i should search", "i need to verify", "i need to check",
+            "wait,", "hold on,", "before i answer"
+        ]
+        if reasoningPrefixes.contains(where: { normalized.hasPrefix($0) }) {
+            return true
+        }
+
+        if normalized.contains("search") && normalized.contains("let me") {
+            return true
+        }
+
+        if normalized.contains("search again") || normalized.contains("another search") {
+            return true
+        }
+
+        return false
+    }
+
+    internal func updateMessageWithReasoningContent(_ message: Message, fullText: String, finalize: Bool = false) {
+        // Stops at the first visible character instead of trimming a copy of the output.
+        guard fullText.contains(where: { !$0.isWhitespace }) else {
+            logger.warning("updateMessageWithReasoningContent called with empty text (len=\(fullText.count, privacy: .public), id=\(message.id, privacy: .public), reasoning=\(message.isReasoningMode, privacy: .public))")
+            return // Don't update with empty content
+        }
+
+        // 1) During streaming, keep updates lightweight to avoid UI lag on long outputs.
+        // Full cleanup is done on final flush.
+        let cleanedText: String
+        if finalize {
+            let noSearchTags = stripSearchTags(fullText)
+            cleanedText = Self.cleanGlitchedText(noSearchTags)
+        } else {
+            cleanedText = fullText
+        }
+
+        // 2) Preserve or extract any <sources> from either the existing message content or this
+        // update. The regex runs only when a tag is present. Stored content carries its sources
+        // block at the start, where this method and captureSearchInvocations put it.
+        let existingCarrier = message.isReasoningMode ? (message.finalAnswer ?? message.text) : message.text
+        let newSources = Self.containsSourcesTag(cleanedText) ? extractSources(from: cleanedText) : nil
+        let chosenSources = newSources ?? (existingCarrier.hasPrefix("<sources>") ? extractSources(from: existingCarrier) : nil)
+        let sourcesBlock = chosenSources.map { "<sources>\n\($0)\n</sources>\n\n" } ?? ""
+
+        // 3) Remove <sources> from the cleanedText that we will display
+        let visiblePortion = newSources?.isEmpty == false ? cleanedText.removingSourcesBlocks() : cleanedText
+
+        // Every assignment below compares first: writing an unchanged value still
+        // dirties the SwiftData row and re-renders the bubble.
+        if message.isReasoningMode {
+            // MLX reasoning path: the <think> opening tag is baked into the prompt prefix,
+            // so the streamed output starts with raw thinking content and ends with </think>.
+            // Before </think> arrives all content is in-progress reasoning with no tags at all.
+            let isMLX = backendBridge.selectedBackend == .mlx
+            // One scan answers both whether reasoning has closed and how many passes there were.
+            let closeTagCount = isMLX ? Self.reasoningCloseTagCount(in: visiblePortion) : 0
+            if isMLX && closeTagCount == 0 {
+                // Still thinking – show in the reasoning bubble, nothing in the answer yet.
+                let r = visiblePortion.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !r.isEmpty {
+                    message.setIfChanged(\.reasoning, to: r)
+                }
+                return
+            }
+
+            // A tool call starts a new reasoning pass, so the answer follows the
+            // last `</think>`, not the first. The call itself marks this before
+            // its search is recorded, and a rejected call records no search.
+            let phase = message.streamingReasoningPhase ?? .initialThinking
+            let hasLiveSearches = !((message.searchInvocations ?? []).isEmpty)
+            let isToolSession = isMLX && (
+                hasLiveSearches ||
+                phase == .postToolReasoning ||
+                closeTagCount > 1
+            )
+
+            if isToolSession && !finalize && phase == .postToolReasoning {
+                let boundaryCount = message.postToolReasoningStartCloseTagCount ?? closeTagCount
+                if closeTagCount <= boundaryCount {
+                    let provisionalReasoning = ReasoningTextSanitizer.string(from: visiblePortion)
+                    if !provisionalReasoning.isEmpty {
+                        message.setIfChanged(\.reasoning, to: provisionalReasoning)
+                    }
+                    message.setIfChanged(\.text, to: "")
+                    message.setIfChanged(\.finalAnswer, to: sourcesBlock.isEmpty ? nil : sourcesBlock)
+                    return
+                }
+
+                message.completeReasoningCapture()
+                message.setIfChanged(\.streamingReasoningPhase, to: .finalAnswer)
+                message.setIfChanged(\.postToolReasoningStartCloseTagCount, to: nil)
+            }
+
+            let parsed = if isToolSession {
+                Self.parseReasoningResponseForSearchSessionText(visiblePortion)
+            } else {
+                parseReasoningResponse(visiblePortion)
+            }
+
+            // Always update reasoning if present
+            if let reasoning = parsed.reasoning {
+                message.setIfChanged(\.reasoning, to: reasoning)
+            }
+
+            // Only update final answer (and visible text) when we actually have one
+            if let answer = parsed.finalAnswer {
+                // Prepend hidden sources (if any) into finalAnswer so UI can find them
+                message.setIfChanged(\.finalAnswer, to: sourcesBlock + answer)
+                message.setIfChanged(\.text, to: answer) // Keep raw visible text for non-reasoning fallbacks
+                message.completeReasoningCapture()
+                message.setIfChanged(\.streamingReasoningPhase, to: .finalAnswer)
+                message.setIfChanged(\.postToolReasoningStartCloseTagCount, to: nil)
+            } else {
+                // While only reasoning is present, keep the visible text empty or last known final answer
+                if parsed.reasoning == nil && visiblePortion.contains("<thinking>") {
+                    // Keep raw text for UI fallback parsing
+                    message.setIfChanged(\.text, to: visiblePortion)
+                } else if parsed.reasoning == nil && !visiblePortion.isEmpty {
+                    // No reasoning detected, but we have content (likely an error message or plain text)
+                    // Store it directly in text so it's visible
+                    message.setIfChanged(\.text, to: visiblePortion)
+                } else {
+                    // Extract visible text from finalAnswer (if any) without sources
+                    message.setIfChanged(\.text, to: message.finalAnswer?.removingSourcesBlocks() ?? "")
+                }
+                // If we have sources already but no final answer yet, ensure they're retained in finalAnswer
+                if chosenSources != nil && (message.finalAnswer ?? "").isEmpty {
+                    message.setIfChanged(\.finalAnswer, to: sourcesBlock)
+                }
+            }
+        } else {
+            // Non-reasoning: prepend hidden sources into the stored text so UI can extract and show button
+            message.setIfChanged(\.text, to: sourcesBlock + visiblePortion)
+        }
+    }
+
+    /// Cheap check before running the sources regex over the whole output.
+    private static func containsSourcesTag(_ text: String) -> Bool {
+        text.range(of: "<sources>", options: .caseInsensitive) != nil
+    }
+}
+

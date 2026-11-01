@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check translation coverage, plural forms, and format arguments without Xcode.
 
-The languages to check are read from `AppLanguage` in ChatLLM/AppLanguage.swift,
+The languages to check are read from `AppLanguage` in Minnow/AppLanguage.swift,
 so adding a case there is enough to have its translations validated.
 
 Run with `--self-test` to check the validator's own rules.
@@ -50,10 +50,10 @@ def placeholders_match(value, key, plural_category):
 
 
 def app_languages(root):
-    source = (root / "ChatLLM" / "AppLanguage.swift").read_text()
+    source = (root / "Minnow" / "AppLanguage.swift").read_text()
     enum = re.search(r"enum AppLanguage\b[^{]*\{(.*?)\n\}", source, re.S)
     if enum is None:
-        raise SystemExit("Could not find `enum AppLanguage` in ChatLLM/AppLanguage.swift")
+        raise SystemExit("Could not find `enum AppLanguage` in Minnow/AppLanguage.swift")
     languages = re.findall(r'^\s*case\s+\w+\s*=\s*"([^"]+)"', enum.group(1), re.M)
     if not languages:
         raise SystemExit("`enum AppLanguage` declares no languages")
@@ -116,7 +116,7 @@ def main():
     languages = app_languages(root)
     errors = []
     count = 0
-    for path in sorted((root / "ChatLLM").glob("*.xcstrings")):
+    for path in sorted((root / "Minnow").glob("*.xcstrings")):
         catalog_count, catalog_errors = validate_catalog(path.name, json.loads(path.read_text()), languages)
         count += catalog_count
         errors += catalog_errors

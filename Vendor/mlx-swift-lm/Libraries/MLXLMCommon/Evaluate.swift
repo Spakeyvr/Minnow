@@ -442,7 +442,7 @@ public struct RepetitionContext: LogitProcessor, @unchecked Sendable {
 
 /// Processor that applies a presence penalty to any token already seen in the prompt or output.
 ///
-/// ChatLLM patch: the penalty lives in a vocabulary-sized vector holding
+/// Minnow patch: the penalty lives in a vocabulary-sized vector holding
 /// `presencePenalty` at every seen token and 0 elsewhere. Each sampled token
 /// is one scatter into it and `process` is one subtraction, so per-token cost
 /// stays constant instead of growing with an index list that gained an entry
@@ -732,7 +732,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
             // Cache updates are functional MLX operations. Evaluate their state
             // alongside the token so lazy update chains do not retain every
-            // previous decode step's intermediates. ChatLLM patch: the backing
+            // previous decode step's intermediates. Minnow patch: the backing
             // buffers (`innerState`) rather than `state`, whose getters build
             // new slice arrays per layer on every token.
             asyncEval([token] + cache.flatMap { layer in

@@ -1,6 +1,6 @@
-# ChatLLM
+# Minnow
 
-ChatLLM is an iPhone and iPad app for chatting with language models that run entirely on your device. It works with Apple Intelligence on supported hardware, and it can also download open models and run them locally with MLX. Your conversations stay on the device.
+Minnow is an iPhone and iPad app for chatting with language models that run entirely on your device. It works with Apple Intelligence on supported hardware, and it can also download open models and run them locally with MLX. Your conversations stay on the device.
 
 The app is in beta, so expect some rough edges.
 
@@ -35,17 +35,17 @@ MLX models also run in the iOS Simulator on Apple silicon Macs. Memory use and s
 Open the project in Xcode:
 
 ```bash
-open ChatLLM.xcodeproj
+open Minnow.xcodeproj
 ```
 
-Select the `ChatLLM` scheme, pick a simulator or connected device, and run. Xcode resolves the Swift packages automatically.
+Select the `Minnow` scheme, pick a simulator or connected device, and run. Xcode resolves the Swift packages automatically.
 
 The shared scheme runs the app in the Release configuration on purpose: MLX inference is far too slow in an unoptimized Debug build. Tests still build in Debug. To step through code in the debugger or reach `#if DEBUG` paths such as the Markdown rendering preview, duplicate the scheme as a personal (not shared) scheme and set its Run action to Debug, rather than changing the shared one.
 
 To check that the app compiles from the command line:
 
 ```bash
-xcodebuild -project ChatLLM.xcodeproj -scheme ChatLLM -destination 'generic/platform=iOS Simulator' build
+xcodebuild -project Minnow.xcodeproj -scheme Minnow -destination 'generic/platform=iOS Simulator' build
 ```
 
 Warnings are treated as errors, so any new warning will fail the build.
@@ -55,10 +55,10 @@ Warnings are treated as errors, so any new warning will fail the build.
 Run the tests with Product > Test in Xcode, or from the terminal:
 
 ```bash
-xcodebuild -project ChatLLM.xcodeproj -scheme ChatLLM -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
+xcodebuild -project Minnow.xcodeproj -scheme Minnow -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-Replace the simulator name with one installed on your Mac. Unit tests use Swift Testing and live in `ChatLLMTests/`. UI tests use XCTest and live in `ChatLLMUITests/`. The tests use mocks and launch flags, so they do not need downloaded models, network access, or an API key.
+Replace the simulator name with one installed on your Mac. Unit tests use Swift Testing and live in `MinnowTests/`. UI tests use XCTest and live in `MinnowUITests/`. The tests use mocks and launch flags, so they do not need downloaded models, network access, or an API key.
 
 ## Web search setup
 
@@ -70,15 +70,15 @@ The key is stored in the Keychain. It is only sent to Tavily, together with your
 ## Project structure
 
 ```
-ChatLLM/            App source code
+Minnow/             App source code
   RenderingAssets/  Bundled Markdown and math rendering files
-ChatLLMTests/       Unit tests
-ChatLLMUITests/     UI tests
+MinnowTests/        Unit tests
+MinnowUITests/      UI tests
 Vendor/             Local copies of the MLX Swift packages
 Scripts/            Helper scripts
 ```
 
-The packages in `Vendor/` include a few local patches. `Vendor/mlx-swift/README-ChatLLM.md` describes each change.
+The packages in `Vendor/` include a few local patches. `Vendor/mlx-swift/README-Minnow.md` describes each change.
 
 ## Translations
 
@@ -90,4 +90,4 @@ Email [chatllm@icloud.com](mailto:chatllm@icloud.com), or join the Discord serve
 
 ## License
 
-ChatLLM is released under the Apache 2.0 license. See [LICENSE](LICENSE).
+Minnow is released under the Apache 2.0 license. See [LICENSE](LICENSE).
